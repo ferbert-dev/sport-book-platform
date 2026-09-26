@@ -311,10 +311,13 @@
    * An open socket is not the same as a working subscription. Report the weaker of the
    * two, so the indicator can never claim live updates we have not confirmed.
    */
-  function setLive(confirmed) {
+  function setLive(confirmed, pendingLabel) {
     state.liveConfirmed = confirmed;
     if (!state.ws) return;
-    setWsState(confirmed ? "live" : "connected · not subscribed", confirmed ? true : null);
+    if (confirmed) { setWsState("live", true); return; }
+    // Socket is up but the subscription is not confirmed: neutral, never green, and
+    // never red either — red is reserved for a closed socket.
+    setWsState(pendingLabel || "connected · not subscribed", null);
   }
 
   async function toggleStream() {
@@ -351,6 +354,11 @@
       state.subscribedEventId = eventId;
       state.buffer = [];
       state.buffering = true;
+
+      // Health does not carry over between subscriptions. Without this the indicator
+      // keeps reporting the PREVIOUS event's "live" for the whole ack window, while we
+      // are in fact subscribed to nothing.
+      setLive(false, `subscribing to ${eventId}…`);
 
       // Wait for the ack: the snapshot must not be read until the gateway has actually
       // registered us, or events in between reach neither the snapshot nor the stream.
