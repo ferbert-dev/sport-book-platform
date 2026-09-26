@@ -57,6 +57,44 @@ class SimulatedSportsProviderTest {
     }
 
     @Test
+    void sequenceNumbersAdvanceAcrossCyclesSoTheVersionGuardDoesNotFreezeTheProjection() {
+        int scriptSize = provider.script().size();
+
+        List<ProviderMessage> emitted = provider.messages()
+                .take(scriptSize * 2L)
+                .toList()
+                .blockingGet();
+
+        long firstCycleMax = emitted.subList(0, scriptSize).stream()
+                .mapToLong(ProviderMessage::sequenceNumber).max().orElseThrow();
+        long secondCycleMin = emitted.subList(scriptSize, scriptSize * 2).stream()
+                .mapToLong(ProviderMessage::sequenceNumber).min().orElseThrow();
+
+        assertThat(secondCycleMin)
+                .as("second cycle must start above the first cycle's highest sequence")
+                .isGreaterThan(firstCycleMax);
+    }
+
+    @Test
+    void duplicateAndGapAreStillInjectedOnLaterCycles() {
+        int scriptSize = provider.script().size();
+        SequenceValidator validator = new SequenceValidator();
+
+        List<ProviderMessage> emitted = provider.messages()
+                .take(scriptSize * 2L)
+                .toList()
+                .blockingGet();
+
+        List<SequenceDecision> decisions =
+                emitted.stream().map(m -> validator.evaluate(m.sequenceNumber())).toList();
+
+        assertThat(decisions.stream().filter(d -> d == SequenceDecision.DUPLICATE).count())
+                .as("one duplicate per cycle").isEqualTo(2);
+        assertThat(decisions.stream().filter(d -> d == SequenceDecision.GAP).count())
+                .as("one gap per cycle").isEqualTo(2);
+    }
+
+    @Test
     void streamEmitsTheScriptInOrderAndThenLoops() {
         List<ProviderMessage> emitted = provider.messages()
                 .take(provider.script().size() + 2L)

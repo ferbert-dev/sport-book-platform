@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: bet-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/sportsbook}
+    username: ${DB_USERNAME:sportsbook}
+    password: ${DB_PASSWORD:sportsbook}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+server:
+  port: ${SERVER_PORT:8084}
+
+sportsbook:
+  topics:
+    sports-events: ${SPORTS_EVENTS_TOPIC:sports-events}
+    bet-events: ${BET_EVENTS_TOPIC:bet-events}
+  bet:
+    market-freshness-threshold: 30s
+    # Zero tolerance: any odds movement rejects the bet and the client must re-offer.
+    odds-tolerance: 0
+    outbox-poll-interval: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always

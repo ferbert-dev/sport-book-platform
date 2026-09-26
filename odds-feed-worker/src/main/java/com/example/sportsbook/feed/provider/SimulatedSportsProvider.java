@@ -36,10 +36,44 @@ public class SimulatedSportsProvider {
      */
     public Flowable<ProviderMessage> messages() {
         List<ProviderMessage> script = script();
+        int scriptSize = script.size();
+        long stride = sequenceStride(script);
         return Flowable.interval(0, interval.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
-                .map(tick -> script.get((int) (tick % script.size())))
+                .map(tick -> {
+                    // Each loop advances the sequence by a fixed stride. Replaying the same
+                    // sequence numbers would be correctly discarded by the downstream version
+                    // guard, freezing the projection after one cycle -- a real provider's
+                    // sequence only ever moves forward.
+                    long cycle = tick / scriptSize;
+                    ProviderMessage template = script.get((int) (tick % scriptSize));
+                    return withSequenceOffset(template, cycle * stride);
+                })
                 .toObservable()
                 .toFlowable(BackpressureStrategy.BUFFER);
+    }
+
+    /**
+     * Stride that makes consecutive cycles contiguous: the next cycle starts exactly one past the
+     * previous cycle's highest sequence. A larger stride would inject an extra, unintended gap at
+     * every cycle boundary; a smaller one would replay sequences already processed.
+     */
+    private static long sequenceStride(List<ProviderMessage> script) {
+        long min = script.stream().mapToLong(ProviderMessage::sequenceNumber).min().orElse(0L);
+        long max = script.stream().mapToLong(ProviderMessage::sequenceNumber).max().orElse(0L);
+        return max - min + 1;
+    }
+
+    /** Shifts a scripted message forward, preserving its duplicate/gap relationship. */
+    private static ProviderMessage withSequenceOffset(ProviderMessage message, long offset) {
+        return new ProviderMessage(
+                message.sequenceNumber() + offset,
+                message.messageType(),
+                message.matchId(),
+                message.marketRef(),
+                message.outcomeRef(),
+                message.price(),
+                message.winnerRef(),
+                Instant.now());
     }
 
     /** The scripted lifecycle from the design: prices drift, market locks, reopens, then settles. */

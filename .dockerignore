@@ -1,0 +1,3 @@
+# Keep the build context tiny: only the built service JARs are ever COPYed.
+*
+!*/target/*-1.0.0-SNAPSHOT.jar

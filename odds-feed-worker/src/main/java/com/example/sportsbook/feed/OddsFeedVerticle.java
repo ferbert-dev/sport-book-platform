@@ -118,9 +118,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
                 .doOnComplete(() -> {
                     metrics.oddsFeedEventsPublishedTotal.incrementAndGet();
                     log.info("{} eventId={} marketId={} version={} partitionKey={}",
-                            event.type(), event.eventId(),
-                            event instanceof com.example.sportsbook.common.OddsUpdatedEvent odds
-                                    ? odds.marketId() : "-",
+                            event.type(), event.eventId(), marketIdOf(event),
                             event.version(), event.partitionKey());
                 })
                 .doOnError(error -> {
@@ -129,6 +127,18 @@ public class OddsFeedVerticle extends AbstractVerticle {
                 })
                 // A single failed send must not tear down the long-lived provider stream.
                 .onErrorComplete();
+    }
+
+    /** Market id for market-scoped events; match-level events genuinely have none. */
+    private static String marketIdOf(SportsEvent event) {
+        return switch (event) {
+            case com.example.sportsbook.common.OddsUpdatedEvent e -> e.marketId();
+            case com.example.sportsbook.common.MarketSuspendedEvent e -> e.marketId();
+            case com.example.sportsbook.common.MarketOpenedEvent e -> e.marketId();
+            case com.example.sportsbook.common.MarketSettledEvent e -> e.marketId();
+            case com.example.sportsbook.common.MatchStartedEvent ignored -> "-";
+            case com.example.sportsbook.common.MatchFinishedEvent ignored -> "-";
+        };
     }
 
     @Override

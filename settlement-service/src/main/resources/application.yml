@@ -1,0 +1,54 @@
+spring:
+  application:
+    name: settlement-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/sportsbook}
+    username: ${DB_USERNAME:sportsbook}
+    password: ${DB_PASSWORD:sportsbook}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    # Schema ownership: bet-service owns ALL migrations for this database.
+    # Settlement reads and writes the same tables but must never migrate them.
+    enabled: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: settlement-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable-auto-commit: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+    listener:
+      ack-mode: record
+
+server:
+  port: ${SERVER_PORT:8085}
+
+sportsbook:
+  topics:
+    sports-events: ${SPORTS_EVENTS_TOPIC:sports-events}
+    bet-events: ${BET_EVENTS_TOPIC:bet-events}
+  settlement:
+    payout-currency: EUR
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always

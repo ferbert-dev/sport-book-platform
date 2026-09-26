@@ -40,6 +40,14 @@
     <rxjava.version>3.1.10</rxjava.version>
     <testcontainers.version>1.21.3</testcontainers.version>
 
+    <!--
+      Docker Engine 29 raised its minimum API version to 1.40, but the docker-java client
+      bundled with Testcontainers negotiates v1.32, which the daemon rejects with HTTP 400.
+      Pinning the client API version makes Testcontainers detect Docker again.
+      Override with -Ddocker.api.version=... on an older daemon (1.44 needs Docker >= 25).
+    -->
+    <docker.api.version>1.44</docker.api.version>
+
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
     <maven-surefire-plugin.version>3.5.2</maven-surefire-plugin.version>
     <maven-failsafe-plugin.version>3.5.2</maven-failsafe-plugin.version>
@@ -101,11 +109,27 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${maven-surefire-plugin.version}</version>
+          <configuration>
+            <systemPropertyVariables>
+              <api.version>${docker.api.version}</api.version>
+            </systemPropertyVariables>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-failsafe-plugin</artifactId>
           <version>${maven-failsafe-plugin.version}</version>
+          <configuration>
+            <!--
+              Failsafe runs after `package`, so by default it puts the repackaged Spring Boot
+              fat JAR on the test classpath, where application classes sit under BOOT-INF/classes
+              and are invisible to component scanning. Point it at target/classes instead.
+            -->
+            <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+            <systemPropertyVariables>
+              <api.version>${docker.api.version}</api.version>
+            </systemPropertyVariables>
+          </configuration>
           <executions>
             <execution>
               <goals>
@@ -139,6 +163,15 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
+      </plugin>
+      <!--
+        Inherited by every module so *IT classes run in the `verify` phase.
+        The integration tests self-disable when Docker is unavailable, so
+        `./mvnw clean verify` succeeds with or without a running daemon.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
       </plugin>
     </plugins>
   </build>
