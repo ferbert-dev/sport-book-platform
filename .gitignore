@@ -1,0 +1,14 @@
+target/
+!.mvn/wrapper/maven-wrapper.properties
+.mvn/wrapper/*.jar
+
+*.class
+*.log
+*.jar.original
+
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+*.iml
+
+.DS_Store

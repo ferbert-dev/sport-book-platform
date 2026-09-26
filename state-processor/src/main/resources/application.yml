@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: state-processor
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: state-processor
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # At-least-once: offsets are committed after the listener returns successfully.
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+
+server:
+  port: ${SERVER_PORT:8081}
+
+sportsbook:
+  topics:
+    sports-events: ${SPORTS_EVENTS_TOPIC:sports-events}
+    bet-events: ${BET_EVENTS_TOPIC:bet-events}
+  state:
+    # How old market state may get before it is treated as STALE_FEED.
+    market-freshness-threshold: 30s
+    stale-check-interval: 10s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
