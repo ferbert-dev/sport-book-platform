@@ -197,6 +197,10 @@
     buffering: false,
     buffer: [],
     snapshotSeq: 0,
+    // Serialises overlapping syncTo() calls: only the newest generation may install
+    // state or drain the buffer, so two syncs cannot interleave through one buffer.
+    syncSeq: 0,
+    pendingAck: null,
     balance: START_BALANCE,
     openBets: [],
     lastBet: null,
@@ -216,16 +220,19 @@
   }
 
   // ---------------------------------------------------------------- stream
+  let socketPromise = null;
+
   function ensureSocket() {
     if (state.ws && state.ws.readyState === WebSocket.OPEN) return Promise.resolve(state.ws);
-    if (state.ws) return Promise.reject(new Error("socket still opening"));
+    // Concurrent callers await the same handshake instead of the later one failing.
+    if (socketPromise) return socketPromise;
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/api/v1/stream`);
     state.ws = ws;
     setWsState("connecting…", null);
 
-    return new Promise((resolve, reject) => {
+    socketPromise = new Promise((resolve, reject) => {
       ws.onopen = () => {
         setWsState("connected", true);
         $("wsBtn").textContent = "Disconnect";
@@ -235,11 +242,40 @@
       ws.onerror = () => { log("websocket error", "err"); reject(new Error("ws error")); };
       ws.onclose = () => {
         state.ws = null;
+        socketPromise = null;
         state.subscribedEventId = null;
+        // Without this a drop mid-sync leaves buffering stuck on, and every later
+        // frame is buffered and never drained.
+        state.buffering = false;
+        state.buffer = [];
+        state.pendingAck = null;
         setWsState("disconnected", false);
         $("wsBtn").textContent = "Connect";
         log("stream closed", "sys");
       };
+    });
+    socketPromise.catch(() => { socketPromise = null; });
+    return socketPromise;
+  }
+
+  /**
+   * Sends SUBSCRIBE and waits for the gateway's SUBSCRIBED ack.
+   *
+   * The gateway registers the subscription asynchronously, so reading the snapshot
+   * straight after send() leaves a window whose events reach nobody. Waiting for the
+   * ack closes it. Falls through after a timeout rather than hanging the UI.
+   */
+  function subscribeAndAwaitAck(ws, eventId, timeoutMs = 4000) {
+    return new Promise((resolve) => {
+      state.pendingAck = { eventId, resolve };
+      ws.send(JSON.stringify({ action: "SUBSCRIBE", eventId }));
+      setTimeout(() => {
+        if (state.pendingAck && state.pendingAck.eventId === eventId) {
+          state.pendingAck = null;
+          log(`no SUBSCRIBED ack for ${eventId} within ${timeoutMs}ms — continuing`, "err");
+          resolve(false);
+        }
+      }, timeoutMs);
     });
   }
 
@@ -261,12 +297,15 @@
    */
   async function syncTo(eventId) {
     if (!eventId) return;
+    const gen = ++state.syncSeq;
     try {
       const ws = await ensureSocket();
+      if (gen !== state.syncSeq) return;
 
       if (state.subscribedEventId && state.subscribedEventId !== eventId) {
         ws.send(JSON.stringify({ action: "UNSUBSCRIBE", eventId: state.subscribedEventId }));
         log(`UNSUBSCRIBE ${state.subscribedEventId}`, "sys");
+        warnAboutAbandonedBets(state.subscribedEventId);
       }
 
       // Tracking a different event means the old projection is meaningless.
@@ -279,15 +318,34 @@
       state.subscribedEventId = eventId;
       state.buffer = [];
       state.buffering = true;
-      ws.send(JSON.stringify({ action: "SUBSCRIBE", eventId }));
-      log(`SUBSCRIBE ${eventId} (buffering until snapshot)`, "sys");
 
-      await loadSnapshot(eventId);
+      // Wait for the ack: the snapshot must not be read until the gateway has actually
+      // registered us, or events in between reach neither the snapshot nor the stream.
+      await subscribeAndAwaitAck(ws, eventId);
+      if (gen !== state.syncSeq) return;
+      log(`SUBSCRIBE ${eventId} acked (buffering until snapshot)`, "sys");
+
+      await loadSnapshot(eventId, gen);
+      if (gen !== state.syncSeq) return;
       drainBuffer();
     } catch (e) {
-      state.buffering = false;
+      if (gen === state.syncSeq) state.buffering = false;
       log(`sync failed: ${e.message}`, "err");
     }
+  }
+
+  /**
+   * Open bets on an event we stop tracking can never be resolved: their MARKET_SETTLED
+   * arrives on a subscription we just dropped. Say so rather than leaving them
+   * silently OPEN and the balance quietly wrong.
+   */
+  function warnAboutAbandonedBets(oldEventId) {
+    const stranded = state.openBets.filter((b) => b.status === "OPEN" && b.eventId === oldEventId);
+    if (!stranded.length) return;
+    for (const bet of stranded) bet.status = "UNTRACKED";
+    log(`${stranded.length} open bet(s) on ${oldEventId} can no longer be settled here `
+        + `— the backend still settles them, this client just stops seeing it`, "err");
+    renderBalance();
   }
 
   function drainBuffer() {
@@ -295,7 +353,13 @@
     state.buffer = [];
     state.buffering = false;
     let applied = 0;
-    for (const ev of held) if (apply(ev)) applied++;
+    for (const ev of held) {
+      if (apply(ev)) applied++;
+      // Settlement is a terminal fact, not a projection update: resolve regardless of
+      // whether the version guard moved local state, or a settlement that landed during
+      // the buffer window would never credit the payout.
+      if (ev.type === "MARKET_SETTLED") resolveBets(ev);
+    }
     if (held.length) {
       log(`drained ${held.length} buffered frame(s), ${applied} newer than snapshot`, "sys");
       render();
@@ -306,7 +370,16 @@
     let msg;
     try { msg = JSON.parse(raw); } catch { log(`unparseable frame: ${raw}`, "err"); return; }
 
-    if (msg.action) { log(`${msg.action} ${msg.eventId ?? ""}`, "sys"); return; }
+    if (msg.action) {
+      if (msg.action === "SUBSCRIBED" && state.pendingAck
+          && state.pendingAck.eventId === msg.eventId) {
+        const { resolve } = state.pendingAck;
+        state.pendingAck = null;
+        resolve(true);
+      }
+      log(`${msg.action} ${msg.eventId ?? ""}`, "sys");
+      return;
+    }
     if (msg.error)  { log(`server: ${msg.error}`, "err"); return; }
     if (!msg.type)  return;
 
@@ -323,10 +396,11 @@
     const applied = apply(msg);
     log(`${msg.type} v${msg.version} ${applied ? "applied" : "ignored (not newer than local state)"}`,
         applied ? "applied" : "ignored");
-    if (applied) {
-      if (msg.type === "MARKET_SETTLED") resolveBets(msg);
-      render();
-    }
+    // Redelivery is expected under at-least-once, and the version guard discards it.
+    // Settling must not depend on that guard: resolveBets is idempotent per bet, so a
+    // duplicate cannot double-credit, but skipping it would silently lose the payout.
+    if (msg.type === "MARKET_SETTLED") resolveBets(msg);
+    if (applied) render();
   }
 
   function apply(ev) {
@@ -360,7 +434,7 @@
   }
 
   // ---------------------------------------------------------------- snapshot
-  async function loadSnapshot(eventId) {
+  async function loadSnapshot(eventId, gen) {
     // Guards against out-of-order responses: only the newest request may install state.
     const seq = ++state.snapshotSeq;
     let snap;
@@ -377,7 +451,10 @@
       log(`snapshot failed: ${e.message}`, "err");
       return;
     }
-    if (seq !== state.snapshotSeq) { log("discarded a superseded snapshot response", "sys"); return; }
+    if (seq !== state.snapshotSeq || (gen != null && gen !== state.syncSeq)) {
+      log("discarded a superseded snapshot response", "sys");
+      return;
+    }
 
     if (!state.event || (snap.version ?? 0) > (state.event.version ?? -1) || state.event.status == null) {
       state.event = { eventId: snap.eventId, status: snap.status, version: state.event?.version ?? -1 };
@@ -522,7 +599,7 @@
         } else {
           state.balance -= stake;
           state.openBets.push({
-            betId: json.betId, marketId, selectionId, stake,
+            betId: json.betId, eventId: body.eventId, marketId, selectionId, stake,
             odds: Number(json.acceptedOdds), status: "OPEN",
           });
           log(`stake -${stake.toFixed(2)} → balance ${state.balance.toFixed(2)}`, "money");
