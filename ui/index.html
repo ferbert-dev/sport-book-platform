@@ -201,6 +201,9 @@
     // state or drain the buffer, so two syncs cannot interleave through one buffer.
     syncSeq: 0,
     pendingAck: null,
+    // Whether the gateway has confirmed (or demonstrated) that we are subscribed.
+    // A snapshot with no live stream must never be presented as live.
+    liveConfirmed: false,
     balance: START_BALANCE,
     openBets: [],
     lastBet: null,
@@ -248,6 +251,7 @@
         // frame is buffered and never drained.
         state.buffering = false;
         state.buffer = [];
+        state.liveConfirmed = false;
         // Settle any in-flight ack wait, or syncTo() awaits a promise that can never
         // resolve once the socket is gone.
         if (state.pendingAck) state.pendingAck.settle(false, "stream closed before SUBSCRIBED ack");
@@ -303,6 +307,16 @@
     $("wsDot").className = "dot " + (ok === true ? "on" : ok === false ? "off" : "");
   }
 
+  /**
+   * An open socket is not the same as a working subscription. Report the weaker of the
+   * two, so the indicator can never claim live updates we have not confirmed.
+   */
+  function setLive(confirmed) {
+    state.liveConfirmed = confirmed;
+    if (!state.ws) return;
+    setWsState(confirmed ? "live" : "connected · not subscribed", confirmed ? true : null);
+  }
+
   async function toggleStream() {
     if (state.ws) { state.ws.close(); return; }
     await syncTo($("eventId").value.trim());
@@ -340,9 +354,17 @@
 
       // Wait for the ack: the snapshot must not be read until the gateway has actually
       // registered us, or events in between reach neither the snapshot nor the stream.
-      await subscribeAndAwaitAck(ws, eventId);
+      const acked = await subscribeAndAwaitAck(ws, eventId);
       if (gen !== state.syncSeq) return;
-      log(`SUBSCRIBE ${eventId} acked (buffering until snapshot)`, "sys");
+
+      // A timeout, a close, or a send() that threw all resolve false. Treating those as
+      // a successful subscription would leave a frozen snapshot masquerading as live.
+      setLive(acked);
+      log(acked
+            ? `SUBSCRIBE ${eventId} acked (buffering until snapshot)`
+            : `SUBSCRIBE ${eventId} NOT confirmed — showing a snapshot, but live updates `
+              + `are not guaranteed. Press "Track event" to retry.`,
+          acked ? "sys" : "err");
 
       await loadSnapshot(eventId, gen);
       if (gen !== state.syncSeq) return;
@@ -403,6 +425,14 @@
     // A stale UNSUBSCRIBE race, or the gateway still flushing the previous event, must not
     // let another event's frames corrupt this projection.
     if (msg.eventId && state.subscribedEventId && msg.eventId !== state.subscribedEventId) return;
+
+    // An actual event for this subscription is stronger evidence than the ack: if the ack
+    // was lost or slow, arriving data proves the subscription is live. Self-heal rather
+    // than leaving a working stream labelled unconfirmed.
+    if (!state.liveConfirmed) {
+      setLive(true);
+      log("live updates confirmed by incoming data", "sys");
+    }
 
     if (state.buffering) {
       state.buffer.push(msg);
