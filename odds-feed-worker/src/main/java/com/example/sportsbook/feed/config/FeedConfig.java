@@ -8,7 +8,9 @@ public record FeedConfig(
         String sportsEventsTopic,
         Duration providerInterval,
         String eventId,
-        String marketId
+        String marketId,
+        int devControlPort,
+        boolean autoplay
 ) {
 
     public static FeedConfig fromEnv() {
@@ -17,7 +19,10 @@ public record FeedConfig(
                 env("SPORTS_EVENTS_TOPIC", "sports-events"),
                 Duration.ofMillis(Long.parseLong(env("PROVIDER_INTERVAL_MS", "2000"))),
                 env("DEMO_EVENT_ID", "event-123"),
-                env("DEMO_MARKET_ID", "market-456")
+                env("DEMO_MARKET_ID", "market-456"),
+                Integer.parseInt(env("DEV_CONTROL_PORT", "8086")),
+                // Turn off to drive matches purely from the dev panel with no scripted noise.
+                Boolean.parseBoolean(env("FEED_AUTOPLAY", "true"))
         );
     }
 

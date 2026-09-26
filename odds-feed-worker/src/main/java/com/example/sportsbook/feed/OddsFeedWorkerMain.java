@@ -17,12 +17,22 @@ public final class OddsFeedWorkerMain {
         FeedConfig config = FeedConfig.fromEnv();
         Vertx vertx = Vertx.vertx();
 
-        vertx.rxDeployVerticle(new OddsFeedVerticle(config)).subscribe(
-                deploymentId -> log.info("ODDS_FEED_WORKER_STARTED deploymentId={}", deploymentId),
-                error -> {
-                    log.error("ODDS_FEED_WORKER_START_FAILED", error);
-                    vertx.close();
-                });
+        // The control API always runs; the scripted loop is optional so the dev panel can
+        // drive matches without competing background traffic.
+        vertx.rxDeployVerticle(new DevControlVerticle(config)).subscribe(
+                deploymentId -> log.info("DEV_CONTROL_STARTED deploymentId={}", deploymentId),
+                error -> log.error("DEV_CONTROL_START_FAILED", error));
+
+        if (config.autoplay()) {
+            vertx.rxDeployVerticle(new OddsFeedVerticle(config)).subscribe(
+                    deploymentId -> log.info("ODDS_FEED_WORKER_STARTED deploymentId={}", deploymentId),
+                    error -> {
+                        log.error("ODDS_FEED_WORKER_START_FAILED", error);
+                        vertx.close();
+                    });
+        } else {
+            log.info("FEED_AUTOPLAY_DISABLED scripted-loop=off dev-panel=on");
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("ODDS_FEED_WORKER_STOPPING");

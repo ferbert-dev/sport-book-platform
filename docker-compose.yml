@@ -236,11 +236,18 @@ services:
       args:
         MODULE: odds-feed-worker
     container_name: sportsbook-odds-feed-worker
+    ports:
+      # Dev control API used by the demo panel.
+      - "8086:8086"
     environment:
       <<: *service-env
       PROVIDER_INTERVAL_MS: "2000"
       DEMO_EVENT_ID: event-123
       DEMO_MARKET_ID: market-456
+      DEV_CONTROL_PORT: "8086"
+      # Scripted loop stays on; the dev panel creates independent matches alongside it.
+      # Set to "false" to drive everything by hand with no background traffic.
+      FEED_AUTOPLAY: "true"
     depends_on:
       kafka:
         condition: service_healthy
@@ -269,6 +276,8 @@ services:
       bet-service:
         condition: service_healthy
       realtime-gateway:
+        condition: service_started
+      odds-feed-worker:
         condition: service_started
 
 volumes:
