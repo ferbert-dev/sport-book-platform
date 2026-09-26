@@ -248,7 +248,9 @@
         // frame is buffered and never drained.
         state.buffering = false;
         state.buffer = [];
-        state.pendingAck = null;
+        // Settle any in-flight ack wait, or syncTo() awaits a promise that can never
+        // resolve once the socket is gone.
+        if (state.pendingAck) state.pendingAck.settle(false, "stream closed before SUBSCRIBED ack");
         setWsState("disconnected", false);
         $("wsBtn").textContent = "Connect";
         log("stream closed", "sys");
@@ -267,15 +269,32 @@
    */
   function subscribeAndAwaitAck(ws, eventId, timeoutMs = 4000) {
     return new Promise((resolve) => {
-      state.pendingAck = { eventId, resolve };
-      ws.send(JSON.stringify({ action: "SUBSCRIBE", eventId }));
-      setTimeout(() => {
-        if (state.pendingAck && state.pendingAck.eventId === eventId) {
-          state.pendingAck = null;
-          log(`no SUBSCRIBED ack for ${eventId} within ${timeoutMs}ms — continuing`, "err");
-          resolve(false);
-        }
-      }, timeoutMs);
+      let timer = null;
+
+      // The promise owns its own settlement and is idempotent, so the ack, the timeout
+      // and a socket close can all race to finish it without any of them being able to
+      // leave it pending. Clearing state.pendingAck elsewhere must never be the only
+      // thing that settles it.
+      const finish = (acked, why) => {
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (state.pendingAck === entry) state.pendingAck = null;
+        if (why) log(why, "err");
+        resolve(acked);
+      };
+
+      const entry = { eventId, settle: finish };
+      state.pendingAck = entry;
+
+      timer = setTimeout(
+        () => finish(false, `no SUBSCRIBED ack for ${eventId} within ${timeoutMs}ms — continuing`),
+        timeoutMs);
+
+      try {
+        ws.send(JSON.stringify({ action: "SUBSCRIBE", eventId }));
+      } catch (e) {
+        // Socket can close between the readyState check and send().
+        finish(false, `SUBSCRIBE for ${eventId} could not be sent: ${e.message}`);
+      }
     });
   }
 
@@ -373,9 +392,7 @@
     if (msg.action) {
       if (msg.action === "SUBSCRIBED" && state.pendingAck
           && state.pendingAck.eventId === msg.eventId) {
-        const { resolve } = state.pendingAck;
-        state.pendingAck = null;
-        resolve(true);
+        state.pendingAck.settle(true);
       }
       log(`${msg.action} ${msg.eventId ?? ""}`, "sys");
       return;
