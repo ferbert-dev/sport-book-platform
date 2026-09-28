@@ -12,3 +12,6 @@ target/
 *.iml
 
 .DS_Store
+
+# provider-simulator sequence reservation (host runs)
+.provider-simulator-sequence

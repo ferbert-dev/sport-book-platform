@@ -391,12 +391,18 @@
 
       // A timeout, a close, or a send() that threw all resolve false. Treating those as
       // a successful subscription would leave a frozen snapshot masquerading as live.
-      setLive(acked);
+      // Except: frames for THIS event already arrived while we waited (liveConfirmed was reset
+      // to false above, so only this subscription's data can have set it). That is stronger
+      // proof than the ack, so a late ack timeout must not downgrade it.
+      const provenByFrames = !acked && state.liveConfirmed;
+      if (!provenByFrames) setLive(acked);
       log(acked
             ? `SUBSCRIBE ${eventId} acked (buffering until snapshot)`
-            : `SUBSCRIBE ${eventId} NOT confirmed — showing a snapshot, but live updates `
-              + `are not guaranteed. Press "Track event" to retry.`,
-          acked ? "sys" : "err");
+            : provenByFrames
+              ? `SUBSCRIBE ${eventId} ack timed out, but live frames already arrived — treating as live`
+              : `SUBSCRIBE ${eventId} NOT confirmed — showing a snapshot, but live updates `
+                + `are not guaranteed. Press "Track event" to retry.`,
+          acked || provenByFrames ? "sys" : "err");
 
       await loadSnapshot(eventId, gen);
       if (gen !== state.syncSeq) return;

@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
  * Connects out to the provider's WebSocket feed and exposes it as one endless
@@ -31,9 +32,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * instead of frames piling up in memory. The provider decides what to do with a worker that falls
  * behind (the simulator disconnects it).
  *
- * <p>Messages sent while we are disconnected are gone; the worker's {@link SequenceValidator}
- * sees the jump on reconnect and reports it as a gap. That is why the validator must NOT be reset
- * per connection.
+ * <p><b>Resume:</b> every (re)connect asks for {@code ?fromSequence=<last processed + 1>}, so the
+ * provider replays what we missed while disconnected before live traffic resumes. Whatever the
+ * provider can no longer replay still shows up in the worker's {@link SequenceValidator} as a gap,
+ * which is why the validator must NOT be reset per connection.
+ *
+ * <p>The cursor lives in memory only: a restarted worker resumes from live, not from where the
+ * previous process stopped.
  *
  * <p>Timers run on the Vert.x context scheduler, so every stage stays on the verticle's event loop.
  */
@@ -46,20 +51,25 @@ public class ProviderStreamClient {
     private final ReconnectBackoff backoff;
     private final Scheduler scheduler;
     private final AtomicLong unparseableFrames;
+    private final LongSupplier lastProcessedSequence;
 
     /**
      * @param connectTimeout bounds each connect attempt. Without it, dialing a provider whose host
      *                       has vanished waits out TCP's default (~60s in Vert.x) before the
      *                       backoff even starts.
+     * @param lastProcessedSequence read on every connect to build the resume cursor; negative
+     *                              means nothing processed yet, so no cursor is sent
      */
     public ProviderStreamClient(Vertx vertx, String providerUrl, Duration connectTimeout,
-                                ReconnectBackoff backoff, AtomicLong unparseableFrames) {
+                                ReconnectBackoff backoff, AtomicLong unparseableFrames,
+                                LongSupplier lastProcessedSequence) {
         this.client = vertx.createWebSocketClient(
                 new WebSocketClientOptions().setConnectTimeout((int) connectTimeout.toMillis()));
         this.providerUrl = providerUrl;
         this.backoff = backoff;
         this.scheduler = RxHelper.scheduler(vertx);
         this.unparseableFrames = unparseableFrames;
+        this.lastProcessedSequence = lastProcessedSequence;
     }
 
     /** Cold: each subscription opens its own connection and keeps reconnecting until disposed. */
@@ -79,10 +89,11 @@ public class ProviderStreamClient {
      * {@code retryWhen} only reacts to errors.
      */
     private Flowable<ProviderMessage> connectOnce() {
-        return client.rxConnect(new WebSocketConnectOptions().setAbsoluteURI(providerUrl))
+        String url = resumeUrl(providerUrl, lastProcessedSequence.getAsLong());
+        return client.rxConnect(new WebSocketConnectOptions().setAbsoluteURI(url))
                 .doOnSuccess(socket -> {
                     backoff.reset();
-                    log.info("PROVIDER_CONNECTED url={}", providerUrl);
+                    log.info("PROVIDER_CONNECTED url={}", url);
                 })
                 // One text frame = one provider message. Messages are far below the max frame
                 // size, so the provider never fragments them.
@@ -90,6 +101,13 @@ public class ProviderStreamClient {
                         .concatMapMaybe(this::decode)
                         .concatWith(Flowable.error(
                                 new IllegalStateException("provider closed the stream"))));
+    }
+
+    static String resumeUrl(String providerUrl, long lastProcessed) {
+        if (lastProcessed < 0) {
+            return providerUrl;
+        }
+        return providerUrl + (providerUrl.contains("?") ? "&" : "?") + "fromSequence=" + (lastProcessed + 1);
     }
 
     /** A malformed frame is logged and skipped; it must not tear down the connection. */

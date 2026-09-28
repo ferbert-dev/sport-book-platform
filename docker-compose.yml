@@ -315,6 +315,10 @@ services:
       # Scripted loop stays on; the dev panel creates independent matches alongside it.
       # Set to "false" to drive everything by hand with no background traffic.
       FEED_AUTOPLAY: "true"
+      # Sequence reservation survives container recreation, so versions never go backwards.
+      SIMULATOR_SEQUENCE_FILE: /data/sequence
+    volumes:
+      - provider-simulator-data:/data
 
   # Started last so the consumers are already listening. state-processor and
   # settlement-service read from `earliest` and would catch up regardless, but the
@@ -368,4 +372,5 @@ services:
 
 volumes:
   postgres-data:
+  provider-simulator-data:
   redisinsight-data:

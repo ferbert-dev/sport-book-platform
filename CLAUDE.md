@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 110 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 120 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -221,13 +221,21 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   messages (`PRICE_CHANGE`, `MARKET_LOCK`...) into `ProviderFeed`, never domain events to Kafka.
 - **`provider-simulator` does not depend on `common-domain`.** The contract is the JSON on the wire;
   each side has its own `ProviderMessage`, as it would with a real vendor.
-- **`ProviderFeed` numbers the whole stream** with one sequence, seeded from the wall clock so a
-  restarted simulator never replays sequences the version guard has already seen. It is confined to
-  `SimulatorVerticle`'s context — everything that feeds it runs there, so it needs no locks.
+- **`ProviderFeed` numbers the whole stream** with one sequence. `SequenceReservation` persists a
+  reserved block (hi/lo) to `SIMULATOR_SEQUENCE_FILE` before using it, so a restart always starts
+  above every sequence handed out — even after a clock rollback or a burst faster than 1 msg/ms.
+  The feed is confined to `SimulatorVerticle`'s context — everything that feeds it runs there, so it
+  needs no locks.
+- **Resume, not just reconnect.** The feed keeps a replay window; the worker connects with
+  `?fromSequence=<cursor>` and gets what it missed before live traffic. The cursor is what this
+  process processed, or — right after startup — the highest `version` already on `sports-events`
+  (`LastPublishedSequence`), so a worker restart does not lose a `MARKET_RESULT` sent while it was
+  down. Replay and the live subscription happen in one event-loop turn, so nothing slips between.
 - `ScriptedMatch` loops a match lifecycle, injecting one duplicate and one gap per cycle so those
   paths run at runtime, not only in tests.
-- The worker's `SequenceValidator` is **not** reset per connection: messages missed while
-  disconnected must surface as a gap.
+- The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
+  longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
+  numbering ever restarted lower, a seeded validator would drop everything as duplicates.
 
 ## Logging
 

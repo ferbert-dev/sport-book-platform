@@ -7,13 +7,16 @@ import com.example.sportsbook.simulator.feed.ManualMatch;
 import com.example.sportsbook.simulator.feed.ManualMatchDirector;
 import com.example.sportsbook.simulator.feed.ProviderFeed;
 import com.example.sportsbook.simulator.feed.ScriptedMatch;
+import com.example.sportsbook.simulator.feed.SequenceReservation;
 import com.example.sportsbook.simulator.stream.ProviderStreamHandler;
 import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Single;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.rxjava3.core.AbstractVerticle;
 import io.vertx.rxjava3.core.RxHelper;
+import io.vertx.rxjava3.core.buffer.Buffer;
 import io.vertx.rxjava3.core.http.HttpServer;
 import io.vertx.rxjava3.ext.web.Router;
 import io.vertx.rxjava3.ext.web.RoutingContext;
@@ -27,6 +30,7 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.function.Consumer;
 
 /**
@@ -51,6 +55,8 @@ public class SimulatorVerticle extends AbstractVerticle {
     private ProviderFeed feed;
     private ManualMatchDirector director;
     private HttpServer server;
+    private SequenceReservation reservation;
+    private Disposable reservationKeeper;
     private ScriptedMatch scripted;
     private Disposable scriptedLoop;
     /** Running auto-drifts by eventId. Plain HashMap: only touched on this verticle's context. */
@@ -62,9 +68,42 @@ public class SimulatorVerticle extends AbstractVerticle {
 
     @Override
     public Completable rxStart() {
-        // Seeded from the wall clock so a restarted simulator keeps sequences moving forward.
         Clock clock = Clock.systemUTC();
-        feed = new ProviderFeed(clock.millis(), clock);
+        // The first block is durable BEFORE anything is emitted, so even a crash right after
+        // startup restarts above every sequence this run can hand out.
+        return readPersistedReservation()
+                .map(persisted -> SequenceReservation.startingAt(
+                        clock.millis(), persisted, SequenceReservation.DEFAULT_BLOCK))
+                .flatMapCompletable(started -> {
+                    reservation = started;
+                    return persistReservation(started.reservedUpTo());
+                })
+                .andThen(Completable.defer(() -> startFeedAndServer(clock)));
+    }
+
+    private Single<OptionalLong> readPersistedReservation() {
+        return vertx.fileSystem().rxExists(config.sequenceFile())
+                .flatMap(exists -> !exists
+                        ? Single.just(OptionalLong.empty())
+                        : vertx.fileSystem().rxReadFile(config.sequenceFile())
+                                .map(content -> OptionalLong.of(Long.parseLong(content.toString().trim()))));
+    }
+
+    /** Async file write: never blocks the event loop the feed runs on. */
+    private Completable persistReservation(long reservedUpTo) {
+        return vertx.fileSystem()
+                .rxWriteFile(config.sequenceFile(), Buffer.buffer(Long.toString(reservedUpTo)))
+                .doOnComplete(() -> log.info("SEQUENCE_RESERVED reservedUpTo={} file={}",
+                        reservedUpTo, config.sequenceFile()));
+    }
+
+    private Completable startFeedAndServer(Clock clock) {
+        feed = new ProviderFeed(reservation.start(), clock);
+        // Reserve the next block while half of the current one is still unused.
+        reservationKeeper = feed.messages().subscribe(message ->
+                reservation.extendIfNeeded(feed.lastSequence()).ifPresent(next ->
+                        persistReservation(next).subscribe(() -> { },
+                                error -> log.error("SEQUENCE_RESERVATION_WRITE_FAILED reservedUpTo={}", next, error))));
         director = new ManualMatchDirector(feed, java.util.Set.of(config.scriptedMarketId()));
         // Created even with autoplay off, so POST /dev/scripted/start can switch it on later.
         scripted = new ScriptedMatch(config.scriptedEventId(), config.scriptedMarketId());
@@ -338,6 +377,9 @@ public class SimulatorVerticle extends AbstractVerticle {
             scriptedLoop.dispose();
         }
         List.copyOf(autoDrifts.keySet()).forEach(eventId -> stopAutoDrift(eventId, "shutdown"));
+        if (reservationKeeper != null) {
+            reservationKeeper.dispose();
+        }
         if (feed != null) {
             feed.complete();
         }

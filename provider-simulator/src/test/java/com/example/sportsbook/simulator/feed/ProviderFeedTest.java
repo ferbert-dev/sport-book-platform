@@ -61,7 +61,42 @@ class ProviderFeedTest {
     }
 
     @Test
-    void messagesEmittedWithoutASubscriberAreNotReplayedLater() {
+    void replayReturnsEverythingFromTheCursorOnInOrder() {
+        feed.emit(ProviderMessage.matchStart("event-1"));
+        feed.emit(ProviderMessage.marketUnlock("event-1", "market-1"));
+        feed.emit(ProviderMessage.marketResult("event-1", "market-1", "home"));
+
+        ProviderFeed.Replay replay = feed.replayFrom(502L);
+
+        assertThat(replay.complete()).isTrue();
+        assertThat(replay.messages()).extracting(ProviderMessage::sequenceNumber).containsExactly(502L, 503L);
+    }
+
+    @Test
+    void replayWindowIsBoundedAndReportsWhatItCanNoLongerReplay() {
+        ProviderFeed small = new ProviderFeed(0L, Clock.fixed(NOW, ZoneOffset.UTC), 2);
+        small.emit(ProviderMessage.matchStart("event-1"));
+        small.emit(ProviderMessage.matchStart("event-2"));
+        small.emit(ProviderMessage.matchStart("event-3"));
+
+        ProviderFeed.Replay replay = small.replayFrom(1L);
+
+        assertThat(replay.complete()).isFalse();
+        assertThat(replay.messages()).extracting(ProviderMessage::sequenceNumber).containsExactly(2L, 3L);
+    }
+
+    @Test
+    void cursorAtTheHeadReplaysNothingAndIsComplete() {
+        feed.emit(ProviderMessage.matchStart("event-1"));
+
+        ProviderFeed.Replay replay = feed.replayFrom(502L);
+
+        assertThat(replay.complete()).isTrue();
+        assertThat(replay.messages()).isEmpty();
+    }
+
+    @Test
+    void messagesEmittedWithoutASubscriberAreNotPushedToLateSubscribers() {
         feed.emit(ProviderMessage.matchStart("event-1"));
 
         TestSubscriber<ProviderMessage> late = feed.messages().test();

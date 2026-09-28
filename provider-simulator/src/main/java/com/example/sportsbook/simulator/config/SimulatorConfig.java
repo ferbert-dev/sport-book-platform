@@ -9,7 +9,8 @@ public record SimulatorConfig(
         Duration scriptInterval,
         String scriptedEventId,
         String scriptedMarketId,
-        boolean autoplay
+        boolean autoplay,
+        String sequenceFile
 ) {
 
     public static SimulatorConfig fromEnv() {
@@ -21,7 +22,9 @@ public record SimulatorConfig(
                 env("DEMO_EVENT_ID", "event-123"),
                 env("DEMO_MARKET_ID", "market-456"),
                 // Turn off to drive matches purely from the dev panel with no scripted noise.
-                Boolean.parseBoolean(env("FEED_AUTOPLAY", "true"))
+                Boolean.parseBoolean(env("FEED_AUTOPLAY", "true")),
+                // Where the sequence reservation survives restarts; see SequenceReservation.
+                env("SIMULATOR_SEQUENCE_FILE", ".provider-simulator-sequence")
         );
     }
 

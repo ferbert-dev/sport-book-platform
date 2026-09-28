@@ -2,6 +2,7 @@ package com.example.sportsbook.feed;
 
 import com.example.sportsbook.common.SportsEvent;
 import com.example.sportsbook.feed.config.FeedConfig;
+import com.example.sportsbook.feed.messaging.LastPublishedSequence;
 import com.example.sportsbook.feed.messaging.SportsEventPublisher;
 import com.example.sportsbook.feed.provider.MessageNormalizer;
 import com.example.sportsbook.feed.provider.ProviderMessage;
@@ -38,6 +39,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
     private final FeedMetrics metrics = new FeedMetrics();
     private final SequenceValidator sequenceValidator = new SequenceValidator();
 
+    /** Resume point for a freshly started process, read from Kafka before the first connect. */
+    private long lastPublishedAtStartup = -1;
     private SportsEventPublisher publisher;
     private ProviderStreamClient providerClient;
     private Disposable pipeline;
@@ -49,10 +52,34 @@ public class OddsFeedVerticle extends AbstractVerticle {
 
     @Override
     public Completable rxStart() {
+        // Blocking Kafka read, so off the event loop. The pipeline starts only once it is known.
+        return vertx.<Long>rxExecuteBlocking(() -> LastPublishedSequence.read(
+                        config.kafkaBootstrapServers(), config.sportsEventsTopic()))
+                .defaultIfEmpty(-1L)
+                .doOnSuccess(sequence -> {
+                    lastPublishedAtStartup = sequence;
+                    log.info("RESUME_CURSOR_FROM_KAFKA lastPublishedSequence={}", sequence);
+                })
+                .ignoreElement()
+                .andThen(Completable.fromAction(this::startPipeline));
+    }
+
+    /**
+     * Cursor for the provider: what this process has processed, or before that, what an earlier
+     * process got into Kafka. The validator itself is NOT seeded from Kafka — if the provider's
+     * numbering ever restarted lower, a seeded validator would discard everything as duplicates.
+     */
+    private long resumeCursor() {
+        long processed = sequenceValidator.lastProcessedSequence();
+        return processed >= 0 ? processed : lastPublishedAtStartup;
+    }
+
+    private void startPipeline() {
         publisher = new SportsEventPublisher(vertx, config.kafkaBootstrapServers(), config.sportsEventsTopic());
         providerClient = new ProviderStreamClient(vertx, config.providerUrl(), config.providerConnectTimeout(),
                 new ReconnectBackoff(config.reconnectInitialDelay(), config.reconnectMaxDelay()),
-                metrics.oddsFeedMessagesInvalidTotal);
+                metrics.oddsFeedMessagesInvalidTotal,
+                this::resumeCursor);
         log.info("ODDS_FEED_PIPELINE_STARTING providerUrl={} topic={} bootstrap={}",
                 config.providerUrl(), config.sportsEventsTopic(), config.kafkaBootstrapServers());
 
@@ -69,8 +96,6 @@ public class OddsFeedVerticle extends AbstractVerticle {
         metricsLogger = vertx.periodicStream(30_000)
                 .toFlowable()
                 .subscribe(tick -> log.info("FEED_METRICS {}", metrics.snapshot()));
-
-        return Completable.complete();
     }
 
     private boolean validate(ProviderMessage message) {

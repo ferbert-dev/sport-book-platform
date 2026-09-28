@@ -677,6 +677,7 @@ All services read environment variables, with local defaults:
 | `SIMULATOR_PORT` (simulator) | `8086` |
 | `PROVIDER_INTERVAL_MS` (simulator) | `2000` |
 | `FEED_AUTOPLAY` (simulator) | `true` — set `false` to drive matches only from the dev panel |
+| `SIMULATOR_SEQUENCE_FILE` (simulator) | `.provider-simulator-sequence` — the persisted sequence reservation (`/data/sequence` in Docker) |
 
 ---
 
@@ -818,13 +819,13 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-117 tests: 110 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+127 tests: 120 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |
 | `common-domain` | Event JSON round-trips, discriminators, partition keys, decimal scale |
-| `odds-feed-worker` | Sequence validation (duplicate/gap/reset), normalization, reconnect backoff |
-| `provider-simulator` | Feed sequencing, duplicate/gap injection, scripted match lifecycle, custom match ids, auto-drift timing and lease (virtual time) |
+| `odds-feed-worker` | Sequence validation (duplicate/gap/reset), normalization, reconnect backoff, resume cursor |
+| `provider-simulator` | Feed sequencing, duplicate/gap injection, scripted match lifecycle, custom match ids, replay window, restart-safe sequence reservation, auto-drift timing and lease (virtual time) |
 | `state-processor` | Version guard, all projection rules, stale/duplicate rejection |
 | `odds-service` | Snapshot assembly, 404 handling, HTTP contract |
 | `bet-service` | Every rejection path, idempotent replay, insert race, outbox write |
@@ -863,8 +864,10 @@ Honest list. None of these are hidden behind optimistic wording.
    could publish the same row twice. Consumers are idempotent so this is safe, but
    `SELECT … FOR UPDATE SKIP LOCKED` would make it cleaner, and CDC (Debezium) would remove the
    polling entirely.
-4. **Provider resync is simulated.** `requestProviderSnapshot(...)` logs rather than fetching a
-   snapshot. Real recovery needs the provider's replay API and state reconciliation.
+4. **Provider recovery is replay-only.** A reconnecting or restarted worker resumes from a cursor
+   (`?fromSequence=`) and the provider replays from a bounded window. A disconnect longer than that
+   window still leaves a gap, and `requestProviderSnapshot(...)` only logs: real recovery for that
+   case needs the provider's snapshot API and state reconciliation.
 5. **No authentication or authorization.** Any caller can place a bet as any `userId`. A real
    system needs authn, per-user limits, and stake/liability checks.
 6. **No consumer retry or dead-letter topics.** An unparseable record is logged and skipped so it
