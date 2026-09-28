@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 92 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 110 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -48,7 +48,7 @@ There is no linter or formatter configured. Follow the surrounding style.
 
 ### Running the services
 
-All six run from their built JARs — Boot JARs and shaded Vert.x JARs alike:
+All seven run from their built JARs — Boot JARs and shaded Vert.x JARs alike:
 
 ```bash
 java -jar state-processor/target/state-processor-1.0.0-SNAPSHOT.jar          # :8081
@@ -56,11 +56,13 @@ java -jar odds-service/target/odds-service-1.0.0-SNAPSHOT.jar                # :
 java -jar realtime-gateway/target/realtime-gateway-1.0.0-SNAPSHOT.jar        # :8083
 java -jar bet-service/target/bet-service-1.0.0-SNAPSHOT.jar                  # :8084
 java -jar settlement-service/target/settlement-service-1.0.0-SNAPSHOT.jar    # :8085
+java -jar provider-simulator/target/provider-simulator-1.0.0-SNAPSHOT.jar    # :8086 (dev only)
 java -jar odds-feed-worker/target/odds-feed-worker-1.0.0-SNAPSHOT.jar        # no HTTP port
 ```
 
 Order matters: **`bet-service` before `settlement-service`** (it owns the Flyway migrations, and
 settlement runs with Flyway disabled), and **`odds-feed-worker` last** so consumers are listening.
+The worker reconnects with backoff, so starting it before `provider-simulator` is harmless.
 
 `./mvnw -pl <module> -am spring-boot:run` **fails** with "Unable to find a suitable main class" — a
 CLI-invoked goal runs against every reactor project, and `-am` pulls in the root aggregator and
@@ -76,7 +78,7 @@ The design rests on one distinction, and most invariants below follow from it:
 - **PostgreSQL** = durable accepted bets. *Not* rebuildable from Kafka or Redis.
 
 ```
-Provider → odds-feed-worker → Kafka(sports-events) → state-processor → Redis
+Provider ──WebSocket──→ odds-feed-worker → Kafka(sports-events) → state-processor → Redis
                                        ├→ realtime-gateway → WebSocket clients
                                        └→ settlement-service ─┐
                                                               ├→ Postgres
@@ -86,7 +88,8 @@ Client → bet-service → Redis (validate) → Postgres (bet + outbox) → Kafk
 | Module | Stack | Notes |
 | --- | --- | --- |
 | `common-domain` | **plain Java + Jackson** | Events, enums, `RedisKeys`, `SportsbookJson` |
-| `odds-feed-worker` | Vert.x + RxJava 3, **no Spring** | Shaded executable JAR |
+| `odds-feed-worker` | Vert.x + RxJava 3, **no Spring** | Shaded executable JAR; dials the provider over WebSocket |
+| `provider-simulator` | Vert.x + RxJava 3, **no Spring** | **Dev only**, not the platform: fake provider + `/dev` API |
 | `realtime-gateway` | Vert.x Web, **no Spring** | Shaded executable JAR |
 | `state-processor` | Spring Boot | Kafka → Redis projection |
 | `odds-service` | Spring Boot Web | Redis read path only |
@@ -207,12 +210,24 @@ so don't "simplify" it into applying every frame.
 
 ## Simulated provider
 
-`SimulatedSportsProvider` scripts a match lifecycle and loops it, deliberately injecting one
-duplicate and one sequence gap per cycle so those paths run at runtime, not only in tests.
+The provider is an **external service**. `odds-feed-worker` contains no simulation or dev code: it
+dials `PROVIDER_URL` over WebSocket (`ProviderStreamClient`), reconnects with capped exponential
+backoff, and feeds every frame through validate → sequence check → normalize → Kafka.
 
-Its sequence stride is **derived from the script** (`max - min + 1`) so cycles are contiguous. A
-larger stride injects a spurious gap at every cycle boundary; replaying the same sequences makes the
-version guard discard everything and freezes the projection after one cycle. Don't hardcode it.
+Locally the provider is `provider-simulator`, which also serves the `/dev` control API the demo
+panel uses (nginx proxies `/dev/` to it). Keep it that way:
+
+- **Dev traffic must go through the worker's pipeline.** `ManualMatchDirector` emits provider
+  messages (`PRICE_CHANGE`, `MARKET_LOCK`...) into `ProviderFeed`, never domain events to Kafka.
+- **`provider-simulator` does not depend on `common-domain`.** The contract is the JSON on the wire;
+  each side has its own `ProviderMessage`, as it would with a real vendor.
+- **`ProviderFeed` numbers the whole stream** with one sequence, seeded from the wall clock so a
+  restarted simulator never replays sequences the version guard has already seen. It is confined to
+  `SimulatorVerticle`'s context — everything that feeds it runs there, so it needs no locks.
+- `ScriptedMatch` loops a match lifecycle, injecting one duplicate and one gap per cycle so those
+  paths run at runtime, not only in tests.
+- The worker's `SequenceValidator` is **not** reset per connection: messages missed while
+  disconnected must surface as a gap.
 
 ## Logging
 

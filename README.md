@@ -537,7 +537,7 @@ on your host. Both use the same `docker-compose.yml`.
 
 ```bash
 ./mvnw clean package          # build the service JARs
-docker compose up -d --build  # infrastructure, all six services, and the demo UI
+docker compose up -d --build  # infrastructure, all six services, the provider simulator, and the demo UI
 ```
 
 Then open **<http://localhost:8080>**.
@@ -567,7 +567,8 @@ It exists to make the SNAPSHOT + STREAM pattern visible rather than to be a real
 
 The bet window is short by design: the scripted match settles every ~20s, and the market is only
 `ACTIVE` between `MARKET_OPENED` and `MATCH_FINISHED`. Raise `PROVIDER_INTERVAL_MS` on
-`odds-feed-worker` in `docker-compose.yml` to widen it.
+`provider-simulator` in `docker-compose.yml` to widen it, or create a match from the dev panel,
+which stays open until you settle it.
 
 ```bash
 docker compose ps                                  # health of every service
@@ -612,6 +613,7 @@ java -jar odds-service/target/odds-service-1.0.0-SNAPSHOT.jar              # :80
 java -jar realtime-gateway/target/realtime-gateway-1.0.0-SNAPSHOT.jar      # :8083
 java -jar bet-service/target/bet-service-1.0.0-SNAPSHOT.jar                # :8084  (runs Flyway)
 java -jar settlement-service/target/settlement-service-1.0.0-SNAPSHOT.jar  # :8085
+java -jar provider-simulator/target/provider-simulator-1.0.0-SNAPSHOT.jar  # :8086  (dev only)
 java -jar odds-feed-worker/target/odds-feed-worker-1.0.0-SNAPSHOT.jar      # no HTTP port
 ```
 
@@ -621,6 +623,11 @@ settlement runs with Flyway disabled.
 Start `odds-feed-worker` **last**, so the consumers are already listening when events start
 flowing. (They would catch up anyway — `state-processor` and `settlement-service` read from
 `earliest` — but the gateway streams live only.)
+
+`provider-simulator` stands in for the external provider. The worker dials it at
+`ws://localhost:8086/provider/stream` (its `PROVIDER_URL` default) and reconnects with backoff, so
+the two can start in either order. The simulator also serves the `/dev/*` control API on the same
+port, so on the host the dev panel endpoints are `http://localhost:8086/dev/matches` and so on.
 
 #### Alternative: `spring-boot:run`
 
@@ -638,7 +645,7 @@ modules in the local repository first, and it must be run **without `-am`**:
 > of which has a main class. Dropping `-am` restricts the reactor to the one module — which is why
 > the `install` step above is needed to supply `common-domain`.
 
-The feed worker begins emitting simulated provider messages immediately and loops through the
+Once connected, the feed worker receives the simulator's scripted match, which loops through the
 match lifecycle, ending in `MARKET_SETTLED` — which triggers settlement.
 
 ### Useful Maven commands
@@ -664,6 +671,12 @@ All services read environment variables, with local defaults:
 | `DB_USERNAME` / `DB_PASSWORD` | `sportsbook` / `sportsbook` |
 | `SPORTS_EVENTS_TOPIC` | `sports-events` |
 | `BET_EVENTS_TOPIC` | `bet-events` |
+| `PROVIDER_URL` (feed worker) | `ws://localhost:8086/provider/stream` |
+| `PROVIDER_CONNECT_TIMEOUT_MS` (feed worker) | `5000` |
+| `PROVIDER_RECONNECT_INITIAL_MS` / `PROVIDER_RECONNECT_MAX_MS` (feed worker) | `500` / `30000` |
+| `SIMULATOR_PORT` (simulator) | `8086` |
+| `PROVIDER_INTERVAL_MS` (simulator) | `2000` |
+| `FEED_AUTOPLAY` (simulator) | `true` — set `false` to drive matches only from the dev panel |
 
 ---
 
@@ -805,12 +818,13 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-99 tests: 92 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+117 tests: 110 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |
 | `common-domain` | Event JSON round-trips, discriminators, partition keys, decimal scale |
-| `odds-feed-worker` | Sequence validation (duplicate/gap/reset), normalization, provider script |
+| `odds-feed-worker` | Sequence validation (duplicate/gap/reset), normalization, reconnect backoff |
+| `provider-simulator` | Feed sequencing, duplicate/gap injection, scripted match lifecycle, custom match ids, auto-drift timing and lease (virtual time) |
 | `state-processor` | Version guard, all projection rules, stale/duplicate rejection |
 | `odds-service` | Snapshot assembly, 404 handling, HTTP contract |
 | `bet-service` | Every rejection path, idempotent replay, insert race, outbox write |

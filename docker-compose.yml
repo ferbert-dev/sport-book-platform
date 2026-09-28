@@ -6,6 +6,14 @@
 #
 # Infrastructure only (to run services from your IDE or ./mvnw instead):
 #   docker compose up -d kafka kafka-init redis postgres
+#
+# Once up:
+#   http://localhost:8080   demo client
+#   http://localhost:8090   Kafka UI      — the log: topics, partitions, keys, offsets, lag
+#   http://localhost:5540   RedisInsight  — the projection: what is true right now
+#
+# Both inspection UIs are unauthenticated and bind to loopback only. RedisInsight can write
+# and delete keys; do not expose either beyond this machine.
 
 x-service-base: &service-base
   build:
@@ -109,6 +117,66 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # ---------------------------------------------------------------- inspection
+  #
+  # Windows onto the two stores the design turns on, so the Kafka-is-what-happened /
+  # Redis-is-what-is-true-now split is something you can watch rather than take on trust.
+  #
+  # Both are UNAUTHENTICATED ADMIN CONSOLES, so both bind to 127.0.0.1 and not to
+  # 0.0.0.0: the default bind would hand anyone on the same network a browser tab that
+  # writes to this stack. Kafka UI is held read-only below. RedisInsight has no read-only
+  # mode in 2.x — its CLI, key editor and bulk delete are all live — so it stays a
+  # write-capable tool and the loopback bind is the only thing fencing it.
+  #
+  # Skip both with:  docker compose up -d --scale kafka-ui=0 --scale redis-ui=0
+
+  # Browse sports-events and bet-events: partitions, keys, offsets, consumer-group lag.
+  # Partition keys are the thing worth looking at — marketId for market-scoped events,
+  # eventId for match-level — since that is what makes per-key ordering hold.
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.0.0
+    container_name: sportsbook-kafka-ui
+    ports:
+      # 8080 is the demo UI and 8081-8086 are the services, so this lands on 8090.
+      - "127.0.0.1:8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: sportsbook
+      # Internal listener: this is another container, not the host.
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      # Drops Produce Message, topic create/delete and offset resets. Hand-produced events
+      # would also break the per-key version sequences the whole projection depends on —
+      # the feed worker owns that numbering. Inspect here, drive the feed from /dev.
+      KAFKA_CLUSTERS_0_READONLY: "true"
+      # Deliberately NOT setting DYNAMIC_CONFIG_ENABLED: it lets the UI rewrite cluster
+      # configuration, which is not inspection.
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Browse the projection state-processor writes: the market/event hashes and odds hashes
+  # behind RedisKeys. Flush it and the projection rebuilds from the log — that is the point.
+  #
+  # Write-capable, unavoidably: editing or deleting a key here desynchronises the projection
+  # from the log until the next event for that key overwrites it.
+  redis-ui:
+    image: redis/redisinsight:2.70
+    container_name: sportsbook-redis-ui
+    ports:
+      - "127.0.0.1:5540:5540"
+    environment:
+      # Pre-registers the connection, so the page opens on the data instead of a wizard.
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: 6379
+      RI_REDIS_ALIAS: sportsbook
+      RI_ACCEPT_TERMS_AND_CONDITIONS: "true"
+    volumes:
+      - redisinsight-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ---------------------------------------------------------------- services
 
@@ -225,6 +293,29 @@ services:
       kafka:
         condition: service_healthy
 
+  # Dev-only stand-in for the external sports data provider (Sportradar, Betgenius...). It is
+  # NOT part of the platform: it streams provider messages over WebSocket and serves the /dev
+  # control API the demo panel uses. Swap it for a real vendor by changing PROVIDER_URL below.
+  provider-simulator:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: provider-simulator
+    container_name: sportsbook-provider-simulator
+    ports:
+      # /provider/stream (WebSocket) and /dev/* (control API) on one port.
+      - "8086:8086"
+    environment:
+      SIMULATOR_PORT: "8086"
+      PROVIDER_INTERVAL_MS: "2000"
+      DEMO_EVENT_ID: event-123
+      DEMO_MARKET_ID: market-456
+      # Scripted loop stays on; the dev panel creates independent matches alongside it.
+      # Set to "false" to drive everything by hand with no background traffic.
+      FEED_AUTOPLAY: "true"
+
   # Started last so the consumers are already listening. state-processor and
   # settlement-service read from `earliest` and would catch up regardless, but the
   # gateway only forwards live traffic.
@@ -236,18 +327,10 @@ services:
       args:
         MODULE: odds-feed-worker
     container_name: sportsbook-odds-feed-worker
-    ports:
-      # Dev control API used by the demo panel.
-      - "8086:8086"
     environment:
       <<: *service-env
-      PROVIDER_INTERVAL_MS: "2000"
-      DEMO_EVENT_ID: event-123
-      DEMO_MARKET_ID: market-456
-      DEV_CONTROL_PORT: "8086"
-      # Scripted loop stays on; the dev panel creates independent matches alongside it.
-      # Set to "false" to drive everything by hand with no background traffic.
-      FEED_AUTOPLAY: "true"
+      # The worker dials out to the provider and reconnects with backoff if it goes away.
+      PROVIDER_URL: ws://provider-simulator:8086/provider/stream
     depends_on:
       kafka:
         condition: service_healthy
@@ -256,6 +339,8 @@ services:
       settlement-service:
         condition: service_healthy
       realtime-gateway:
+        condition: service_started
+      provider-simulator:
         condition: service_started
 
   # Static demo client behind a reverse proxy, so the page, the REST snapshot, the bet
@@ -270,15 +355,17 @@ services:
       - ./ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
     depends_on:
-      # nginx resolves its upstream names at startup, so the containers must exist first.
+      # nginx re-resolves upstream names per request (see ui/nginx.conf), so this only
+      # orders startup; recreating a service later does not require restarting nginx.
       odds-service:
         condition: service_healthy
       bet-service:
         condition: service_healthy
       realtime-gateway:
         condition: service_started
-      odds-feed-worker:
+      provider-simulator:
         condition: service_started
 
 volumes:
   postgres-data:
+  redisinsight-data:

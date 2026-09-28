@@ -6,17 +6,16 @@ import com.example.sportsbook.feed.messaging.SportsEventPublisher;
 import com.example.sportsbook.feed.provider.MessageNormalizer;
 import com.example.sportsbook.feed.provider.ProviderMessage;
 import com.example.sportsbook.feed.provider.ProviderMessageValidator;
+import com.example.sportsbook.feed.provider.ProviderStreamClient;
+import com.example.sportsbook.feed.provider.ReconnectBackoff;
 import com.example.sportsbook.feed.provider.SequenceDecision;
 import com.example.sportsbook.feed.provider.SequenceValidator;
-import com.example.sportsbook.feed.provider.SimulatedSportsProvider;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.vertx.rxjava3.core.AbstractVerticle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.concurrent.TimeUnit;
 
 /**
  * The reactive ingestion pipeline:
@@ -25,8 +24,9 @@ import java.util.concurrent.TimeUnit;
  *   provider stream -> validate -> sequence check -> normalize -> publish to Kafka
  * </pre>
  *
- * <p>Nothing here blocks: the provider stream is timer-driven and the Kafka send is asynchronous,
- * so the Vert.x event loop is never parked. {@code concatMapCompletable} publishes one record at a
+ * <p>The provider stream is a WebSocket the worker dials out to ({@link ProviderStreamClient}),
+ * reconnecting with backoff. Nothing here blocks: socket reads and Kafka sends are asynchronous and
+ * every stage runs on this verticle's event loop. {@code concatMapCompletable} publishes one record at a
  * time, which both preserves per-partition ordering and propagates backpressure upstream — a slow
  * broker slows consumption of the provider stream rather than growing an unbounded in-flight set.
  */
@@ -39,6 +39,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
     private final SequenceValidator sequenceValidator = new SequenceValidator();
 
     private SportsEventPublisher publisher;
+    private ProviderStreamClient providerClient;
     private Disposable pipeline;
     private Disposable metricsLogger;
 
@@ -49,13 +50,13 @@ public class OddsFeedVerticle extends AbstractVerticle {
     @Override
     public Completable rxStart() {
         publisher = new SportsEventPublisher(vertx, config.kafkaBootstrapServers(), config.sportsEventsTopic());
-        log.info("SPORTS_PROVIDER_CONNECTED eventId={} marketId={} topic={} bootstrap={}",
-                config.eventId(), config.marketId(), config.sportsEventsTopic(), config.kafkaBootstrapServers());
+        providerClient = new ProviderStreamClient(vertx, config.providerUrl(), config.providerConnectTimeout(),
+                new ReconnectBackoff(config.reconnectInitialDelay(), config.reconnectMaxDelay()),
+                metrics.oddsFeedMessagesInvalidTotal);
+        log.info("ODDS_FEED_PIPELINE_STARTING providerUrl={} topic={} bootstrap={}",
+                config.providerUrl(), config.sportsEventsTopic(), config.kafkaBootstrapServers());
 
-        SimulatedSportsProvider provider =
-                new SimulatedSportsProvider(config.eventId(), config.marketId(), config.providerInterval());
-
-        pipeline = provider.messages()
+        pipeline = providerClient.messages()
                 .doOnNext(message -> metrics.oddsFeedMessagesReceivedTotal.incrementAndGet())
                 .filter(this::validate)
                 .filter(this::acceptSequence)
@@ -65,8 +66,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
                         () -> log.info("PROVIDER_STREAM_COMPLETED {}", metrics.snapshot()),
                         error -> log.error("PROVIDER_STREAM_FAILED {}", metrics.snapshot(), error));
 
-        metricsLogger = io.reactivex.rxjava3.core.Observable
-                .interval(30, 30, TimeUnit.SECONDS)
+        metricsLogger = vertx.periodicStream(30_000)
+                .toFlowable()
                 .subscribe(tick -> log.info("FEED_METRICS {}", metrics.snapshot()));
 
         return Completable.complete();
@@ -146,7 +147,9 @@ public class OddsFeedVerticle extends AbstractVerticle {
         log.info("SPORTS_PROVIDER_DISCONNECTED {}", metrics.snapshot());
         dispose(pipeline);
         dispose(metricsLogger);
-        return publisher == null ? Completable.complete() : publisher.close();
+        Completable closeClient = providerClient == null ? Completable.complete() : providerClient.close();
+        Completable closePublisher = publisher == null ? Completable.complete() : publisher.close();
+        return closeClient.onErrorComplete().andThen(closePublisher.onErrorComplete());
     }
 
     private void dispose(Disposable disposable) {

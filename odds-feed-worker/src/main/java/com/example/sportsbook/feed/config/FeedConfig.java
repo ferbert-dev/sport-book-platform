@@ -6,23 +6,22 @@ import java.time.Duration;
 public record FeedConfig(
         String kafkaBootstrapServers,
         String sportsEventsTopic,
-        Duration providerInterval,
-        String eventId,
-        String marketId,
-        int devControlPort,
-        boolean autoplay
+        String providerUrl,
+        Duration providerConnectTimeout,
+        Duration reconnectInitialDelay,
+        Duration reconnectMaxDelay
 ) {
 
     public static FeedConfig fromEnv() {
         return new FeedConfig(
                 env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
                 env("SPORTS_EVENTS_TOPIC", "sports-events"),
-                Duration.ofMillis(Long.parseLong(env("PROVIDER_INTERVAL_MS", "2000"))),
-                env("DEMO_EVENT_ID", "event-123"),
-                env("DEMO_MARKET_ID", "market-456"),
-                Integer.parseInt(env("DEV_CONTROL_PORT", "8086")),
-                // Turn off to drive matches purely from the dev panel with no scripted noise.
-                Boolean.parseBoolean(env("FEED_AUTOPLAY", "true"))
+                // The provider's streaming endpoint. Locally that is provider-simulator; in a real
+                // deployment it would be the vendor's feed URL.
+                env("PROVIDER_URL", "ws://localhost:8086/provider/stream"),
+                Duration.ofMillis(Long.parseLong(env("PROVIDER_CONNECT_TIMEOUT_MS", "5000"))),
+                Duration.ofMillis(Long.parseLong(env("PROVIDER_RECONNECT_INITIAL_MS", "500"))),
+                Duration.ofMillis(Long.parseLong(env("PROVIDER_RECONNECT_MAX_MS", "30000")))
         );
     }
 

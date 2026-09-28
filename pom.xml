@@ -22,6 +22,7 @@
   <modules>
     <module>common-domain</module>
     <module>odds-feed-worker</module>
+    <module>provider-simulator</module>
     <module>state-processor</module>
     <module>odds-service</module>
     <module>bet-service</module>
