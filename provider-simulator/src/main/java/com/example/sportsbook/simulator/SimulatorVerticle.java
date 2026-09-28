@@ -178,7 +178,15 @@ public class SimulatorVerticle extends AbstractVerticle {
         scriptedLoop = vertx.periodicStream(config.scriptInterval().toMillis())
                 .toFlowable()
                 .subscribe(
-                        tick -> scripted.playNext(feed),
+                        tick -> {
+                            try {
+                                scripted.playNext(feed);
+                            } catch (IllegalStateException refused) {
+                                // Keep the loop alive: ScriptedMatch did not advance, so the same
+                                // step is retried on the next tick once the feed accepts again.
+                                log.warn("SCRIPTED_STEP_DEFERRED reason={}", refused.getMessage());
+                            }
+                        },
                         error -> log.error("SCRIPTED_LOOP_FAILED", error));
         log.info("SIMULATOR_AUTOPLAY_ENABLED eventId={} marketId={} intervalMs={}",
                 config.scriptedEventId(), config.scriptedMarketId(), config.scriptInterval().toMillis());

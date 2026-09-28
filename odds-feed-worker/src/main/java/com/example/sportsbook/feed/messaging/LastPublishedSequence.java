@@ -26,12 +26,14 @@ import java.util.Properties;
  * more than was actually delivered.
  *
  * <p><b>Blocking</b> — plain Kafka consumer calls. Run it through {@code executeBlocking}, never on
- * the event loop. It reads only the last record per partition and joins no consumer group.
+ * the event loop. It reads only the last few records per partition and joins no consumer group.
  */
 public final class LastPublishedSequence {
 
     private static final Logger log = LoggerFactory.getLogger(LastPublishedSequence.class);
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
+    /** How far back to look for a readable record when the newest one is malformed. */
+    private static final int LOOKBACK = 10;
 
     private LastPublishedSequence() {
     }
@@ -48,7 +50,7 @@ public final class LastPublishedSequence {
         props.put("key.deserializer", StringDeserializer.class.getName());
         props.put("value.deserializer", StringDeserializer.class.getName());
         props.put("enable.auto.commit", "false");
-        props.put("max.poll.records", "1");
+        props.put("max.poll.records", Integer.toString(LOOKBACK));
 
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
             List<PartitionInfo> partitions = consumer.partitionsFor(topic, TIMEOUT);
@@ -73,14 +75,30 @@ public final class LastPublishedSequence {
         }
     }
 
-    private static long lastVersion(KafkaConsumer<String, String> consumer, TopicPartition partition, long offset) {
-        consumer.seek(partition, offset);
-        for (ConsumerRecord<String, String> record : consumer.poll(TIMEOUT).records(partition)) {
-            if (record.offset() == offset) {
-                return version(record.value());
+    /**
+     * Highest version among the last {@link #LOOKBACK} records of a non-empty partition. Looking back
+     * rather than trusting only the newest record means one malformed record cannot block startup
+     * forever; but if the newest record cannot be fetched at all, or none of the window parses, the
+     * partition's state is unknown and this throws so startup retries instead of guessing.
+     */
+    private static long lastVersion(KafkaConsumer<String, String> consumer, TopicPartition partition, long lastOffset) {
+        consumer.seek(partition, Math.max(0, lastOffset - LOOKBACK + 1));
+        long highest = -1;
+        boolean reachedLast = false;
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        while (!reachedLast && System.nanoTime() < deadline) {
+            for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofMillis(500)).records(partition)) {
+                highest = Math.max(highest, version(record.value()));
+                reachedLast |= record.offset() >= lastOffset;
             }
         }
-        return -1;
+        if (!reachedLast) {
+            throw new IllegalStateException("could not fetch offset " + lastOffset + " of " + partition);
+        }
+        if (highest < 0) {
+            throw new IllegalStateException("no readable version in the last " + LOOKBACK + " records of " + partition);
+        }
+        return highest;
     }
 
     private static long version(String payload) {
@@ -88,6 +106,7 @@ public final class LastPublishedSequence {
             JsonNode version = SportsbookJson.mapper().readTree(payload).get("version");
             return version == null ? -1 : version.asLong(-1);
         } catch (Exception malformed) {
+            log.warn("LAST_PUBLISHED_RECORD_UNREADABLE length={}", payload == null ? 0 : payload.length());
             return -1;
         }
     }

@@ -128,8 +128,9 @@ public class OddsFeedVerticle extends AbstractVerticle {
         metrics.oddsFeedMessagesReceivedTotal.incrementAndGet();
         long sequence = message.sequenceNumber();
         if (!validate(message)) {
-            // Handled, so move past it: a replay would only deliver the same bad message again.
-            sequenceValidator.markProcessed(sequence);
+            // Skipped, but NOT marked processed: the cursor tracks what Kafka acknowledged, and
+            // moving it here would hide any gap in front of this message. The next valid message
+            // still goes through the gap check against the last acknowledged sequence.
             return Completable.complete();
         }
         if (!acceptSequence(message)) {

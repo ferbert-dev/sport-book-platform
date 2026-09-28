@@ -29,19 +29,31 @@ public final class ScriptedMatch {
         this.script = script(matchId, marketId);
     }
 
-    /** Plays the next step into the feed, wrapping around at the end of the script. */
+    /**
+     * Plays the next step into the feed, wrapping around at the end of the script.
+     *
+     * <p>The position moves only after the step succeeded. If the feed refuses (for example
+     * {@code SEQUENCE_RESERVATION_EXHAUSTED}) the exception propagates and the same step is played
+     * on the next call, so a {@code MARKET_RESULT} is delayed, never skipped.
+     */
     public void playNext(ProviderFeed feed) {
         Step step = script.get(position);
-        position = (position + 1) % script.size();
         switch (step) {
             case Step.Send send -> feed.emit(send.draft());
             case Step.Duplicate ignored -> feed.resendLast();
             // A gap alone sends nothing, so play the next step now to keep the pace steady.
             case Step.Gap ignored -> {
                 feed.skipSequence();
+                advance();
                 playNext(feed);
+                return;
             }
         }
+        advance();
+    }
+
+    private void advance() {
+        position = (position + 1) % script.size();
     }
 
     List<Step> steps() {

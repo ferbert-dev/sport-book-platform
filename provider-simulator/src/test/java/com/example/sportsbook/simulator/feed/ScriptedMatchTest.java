@@ -55,6 +55,22 @@ class ScriptedMatchTest {
         assertThat(secondCycleMin).isGreaterThan(firstCycleMax);
     }
 
+    @Test
+    void aStepTheFeedRefusesIsRetriedNotSkipped() {
+        TestSubscriber<ProviderMessage> sent = feed.messages().test();
+        scripted.playNext(feed);                       // MATCH_START
+        feed.setEmitLimit(feed.lastSequence());        // no more capacity
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> scripted.playNext(feed))
+                .isInstanceOf(IllegalStateException.class);
+
+        feed.setEmitLimit(Long.MAX_VALUE);             // capacity back
+        scripted.playNext(feed);
+
+        assertThat(sent.values()).extracting(ProviderMessage::messageType)
+                .containsExactly("MATCH_START", "PRICE_CHANGE");
+    }
+
     /** Plays whole cycles; a gap step also plays the following step, so it is not a tick of its own. */
     private List<ProviderMessage> playCycles(int cycles) {
         TestSubscriber<ProviderMessage> subscriber = feed.messages().test();
