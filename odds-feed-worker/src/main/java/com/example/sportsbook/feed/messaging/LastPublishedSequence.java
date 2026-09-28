@@ -36,7 +36,12 @@ public final class LastPublishedSequence {
     private LastPublishedSequence() {
     }
 
-    /** @return the highest version on the topic, or -1 if it is empty or unreadable */
+    /**
+     * @return the highest version on the topic, or -1 if the topic is empty
+     * @throws RuntimeException if Kafka cannot be read. Deliberately not folded into -1: "empty"
+     *                          makes the worker ask for a full replay, while "unknown" must be
+     *                          retried, never guessed
+     */
     public static long read(String bootstrapServers, String topic) {
         Properties props = new Properties();
         props.put("bootstrap.servers", bootstrapServers);
@@ -63,10 +68,8 @@ public final class LastPublishedSequence {
                     highest = Math.max(highest, lastVersion(consumer, partition, end - 1));
                 }
             }
+            log.debug("LAST_PUBLISHED_SEQUENCE_READ topic={} highest={}", topic, highest);
             return highest;
-        } catch (RuntimeException unreadable) {
-            log.warn("LAST_PUBLISHED_SEQUENCE_UNAVAILABLE topic={} note=resuming-from-live", topic, unreadable);
-            return -1;
         }
     }
 

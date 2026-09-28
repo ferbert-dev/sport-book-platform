@@ -33,6 +33,7 @@ public final class ProviderFeed {
     private final Deque<ProviderMessage> replay = new ArrayDeque<>();
 
     private long lastSequence;
+    private long emitLimit = Long.MAX_VALUE;
     private ProviderMessage lastEmitted;
 
     /**
@@ -52,6 +53,7 @@ public final class ProviderFeed {
 
     /** Stamps the next sequence onto a draft and pushes it to connected subscribers. */
     public ProviderMessage emit(ProviderMessage draft) {
+        ensureWithinLimit();
         ProviderMessage message = draft.stamped(++lastSequence, clock.instant());
         lastEmitted = message;
         replay.addLast(message);
@@ -93,7 +95,23 @@ public final class ProviderFeed {
 
     /** Burns one sequence number without sending it: a provider gap. */
     public void skipSequence() {
+        ensureWithinLimit();
         lastSequence++;
+    }
+
+    /**
+     * Highest sequence the feed may hand out: the last reservation known to be durable. Emitting
+     * past it fails closed, because a restart would then reuse the numbers above it.
+     */
+    public void setEmitLimit(long limit) {
+        this.emitLimit = limit;
+    }
+
+    private void ensureWithinLimit() {
+        if (lastSequence + 1 > emitLimit) {
+            throw new IllegalStateException("SEQUENCE_RESERVATION_EXHAUSTED lastSequence=" + lastSequence
+                    + " durableLimit=" + emitLimit);
+        }
     }
 
     public long lastSequence() {

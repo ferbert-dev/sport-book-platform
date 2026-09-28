@@ -61,6 +61,21 @@ class ProviderFeedTest {
     }
 
     @Test
+    void failsClosedInsteadOfEmittingPastTheDurableReservation() {
+        feed.setEmitLimit(502L);
+        feed.emit(ProviderMessage.matchStart("event-1"));
+        feed.emit(ProviderMessage.matchEnd("event-1"));
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> feed.emit(ProviderMessage.matchStart("event-2")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("SEQUENCE_RESERVATION_EXHAUSTED");
+        assertThat(feed.lastSequence()).isEqualTo(502L);
+
+        feed.setEmitLimit(600L);
+        assertThat(feed.emit(ProviderMessage.matchStart("event-2")).sequenceNumber()).isEqualTo(503L);
+    }
+
+    @Test
     void replayReturnsEverythingFromTheCursorOnInOrder() {
         feed.emit(ProviderMessage.matchStart("event-1"));
         feed.emit(ProviderMessage.marketUnlock("event-1", "market-1"));

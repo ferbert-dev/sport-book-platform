@@ -12,11 +12,15 @@ import com.example.sportsbook.feed.provider.ReconnectBackoff;
 import com.example.sportsbook.feed.provider.SequenceDecision;
 import com.example.sportsbook.feed.provider.SequenceValidator;
 import io.reactivex.rxjava3.core.Completable;
+import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.vertx.rxjava3.core.AbstractVerticle;
+import io.vertx.rxjava3.core.RxHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * The reactive ingestion pipeline:
@@ -27,13 +31,20 @@ import org.slf4j.LoggerFactory;
  *
  * <p>The provider stream is a WebSocket the worker dials out to ({@link ProviderStreamClient}),
  * reconnecting with backoff. Nothing here blocks: socket reads and Kafka sends are asynchronous and
- * every stage runs on this verticle's event loop. {@code concatMapCompletable} publishes one record at a
- * time, which both preserves per-partition ordering and propagates backpressure upstream — a slow
- * broker slows consumption of the provider stream rather than growing an unbounded in-flight set.
+ * every stage runs on this verticle's event loop. {@code concatMapCompletable} takes one message at a
+ * time through all stages, which preserves per-partition ordering and propagates backpressure
+ * upstream — a slow broker slows consumption of the provider stream rather than growing an
+ * unbounded in-flight set.
+ *
+ * <p>A sequence counts as processed only once Kafka has acknowledged it; that is what the resume
+ * cursor sent to the provider is built from.
  */
 public class OddsFeedVerticle extends AbstractVerticle {
 
     private static final Logger log = LoggerFactory.getLogger(OddsFeedVerticle.class);
+    private static final int PUBLISH_ATTEMPTS = 4;
+    private static final long PIPELINE_RESTART_MS = 1_000;
+    private static final long STARTUP_RETRY_MS = 2_000;
 
     private final FeedConfig config;
     private final FeedMetrics metrics = new FeedMetrics();
@@ -52,10 +63,17 @@ public class OddsFeedVerticle extends AbstractVerticle {
 
     @Override
     public Completable rxStart() {
-        // Blocking Kafka read, so off the event loop. The pipeline starts only once it is known.
+        // Blocking Kafka read, so off the event loop. The pipeline starts only once it is known:
+        // an unreadable topic is retried, never mistaken for "nothing published yet" — that
+        // would make us ask for less than we are missing.
         return vertx.<Long>rxExecuteBlocking(() -> LastPublishedSequence.read(
                         config.kafkaBootstrapServers(), config.sportsEventsTopic()))
-                .defaultIfEmpty(-1L)
+                .toSingle()
+                .retryWhen(failures -> failures.concatMap(failure -> {
+                    log.warn("RESUME_CURSOR_UNAVAILABLE reason={} retryInMs={}",
+                            failure.getMessage(), STARTUP_RETRY_MS);
+                    return Flowable.timer(STARTUP_RETRY_MS, TimeUnit.MILLISECONDS, RxHelper.scheduler(vertx));
+                }))
                 .doOnSuccess(sequence -> {
                     lastPublishedAtStartup = sequence;
                     log.info("RESUME_CURSOR_FROM_KAFKA lastPublishedSequence={}", sequence);
@@ -65,8 +83,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
     }
 
     /**
-     * Cursor for the provider: what this process has processed, or before that, what an earlier
-     * process got into Kafka. The validator itself is NOT seeded from Kafka — if the provider's
+     * Cursor for the provider: the last sequence Kafka acknowledged — from this process, or before
+     * that, from an earlier one. The validator itself is NOT seeded from Kafka: if the provider's
      * numbering ever restarted lower, a seeded validator would discard everything as duplicates.
      */
     private long resumeCursor() {
@@ -83,12 +101,20 @@ public class OddsFeedVerticle extends AbstractVerticle {
         log.info("ODDS_FEED_PIPELINE_STARTING providerUrl={} topic={} bootstrap={}",
                 config.providerUrl(), config.sportsEventsTopic(), config.kafkaBootstrapServers());
 
+        // One message is taken through every stage — validate, sequence, normalize, publish, mark —
+        // before the next is looked at. Sequence decisions therefore always see the cursor of the
+        // previous message's ACKNOWLEDGED outcome, not of a message still in flight.
+        //
+        // A publish that keeps failing errors the whole pipeline; retryWhen then resubscribes, which
+        // opens a fresh connection resuming from the last acknowledged sequence, so the provider
+        // replays the failed message rather than it being skipped.
         pipeline = providerClient.messages()
-                .doOnNext(message -> metrics.oddsFeedMessagesReceivedTotal.incrementAndGet())
-                .filter(this::validate)
-                .filter(this::acceptSequence)
-                .concatMapMaybe(message -> Maybe.fromOptional(MessageNormalizer.normalize(message)))
-                .concatMapCompletable(this::publish)
+                .concatMapCompletable(this::process)
+                .retryWhen(failures -> failures.concatMap(failure -> {
+                    log.warn("ODDS_FEED_PIPELINE_RESTARTING reason={} resumeAfterSequence={} retryInMs={}",
+                            failure.getMessage(), resumeCursor(), PIPELINE_RESTART_MS);
+                    return Flowable.timer(PIPELINE_RESTART_MS, TimeUnit.MILLISECONDS, RxHelper.scheduler(vertx));
+                }))
                 .subscribe(
                         () -> log.info("PROVIDER_STREAM_COMPLETED {}", metrics.snapshot()),
                         error -> log.error("PROVIDER_STREAM_FAILED {}", metrics.snapshot(), error));
@@ -96,6 +122,23 @@ public class OddsFeedVerticle extends AbstractVerticle {
         metricsLogger = vertx.periodicStream(30_000)
                 .toFlowable()
                 .subscribe(tick -> log.info("FEED_METRICS {}", metrics.snapshot()));
+    }
+
+    private Completable process(ProviderMessage message) {
+        metrics.oddsFeedMessagesReceivedTotal.incrementAndGet();
+        long sequence = message.sequenceNumber();
+        if (!validate(message)) {
+            // Handled, so move past it: a replay would only deliver the same bad message again.
+            sequenceValidator.markProcessed(sequence);
+            return Completable.complete();
+        }
+        if (!acceptSequence(message)) {
+            return Completable.complete();
+        }
+        return Maybe.fromOptional(MessageNormalizer.normalize(message))
+                .flatMapCompletable(this::publish)
+                // Only now, with Kafka's ack in hand, is the sequence delivered.
+                .doOnComplete(() -> sequenceValidator.markProcessed(sequence));
     }
 
     private boolean validate(ProviderMessage message) {
@@ -109,26 +152,38 @@ public class OddsFeedVerticle extends AbstractVerticle {
     }
 
     private boolean acceptSequence(ProviderMessage message) {
-        long expected = sequenceValidator.lastProcessedSequence() + 1;
-        SequenceDecision decision = sequenceValidator.evaluate(message.sequenceNumber());
+        long sequence = message.sequenceNumber();
+        SequenceDecision decision = sequenceValidator.decide(sequence);
+
+        // First message of a restarted process: the validator is deliberately unseeded, so compare
+        // with the cursor we asked the provider to resume from. A jump means the replay could not
+        // cover everything we were missing.
+        if (sequenceValidator.lastProcessedSequence() < 0 && lastPublishedAtStartup >= 0
+                && sequence > lastPublishedAtStartup + 1) {
+            reportGap(lastPublishedAtStartup + 1, sequence);
+        }
 
         return switch (decision) {
             case IN_ORDER -> true;
             case DUPLICATE -> {
                 metrics.oddsFeedDuplicatesTotal.incrementAndGet();
                 log.info("PROVIDER_DUPLICATE_IGNORED sequenceNumber={} lastProcessedSequence={}",
-                        message.sequenceNumber(), sequenceValidator.lastProcessedSequence());
+                        sequence, sequenceValidator.lastProcessedSequence());
                 yield false;
             }
             case GAP -> {
-                metrics.oddsFeedSequenceGapsTotal.incrementAndGet();
-                log.warn("SEQUENCE_GAP_DETECTED expectedSequence={} receivedSequence={} missed={}",
-                        expected, message.sequenceNumber(), message.sequenceNumber() - expected);
-                requestProviderSnapshot(message.sequenceNumber());
+                reportGap(sequenceValidator.lastProcessedSequence() + 1, sequence);
                 // Still process the message: dropping it would lose real state on top of the gap.
                 yield true;
             }
         };
+    }
+
+    private void reportGap(long expected, long received) {
+        metrics.oddsFeedSequenceGapsTotal.incrementAndGet();
+        log.warn("SEQUENCE_GAP_DETECTED expectedSequence={} receivedSequence={} missed={}",
+                expected, received, received - expected);
+        requestProviderSnapshot(received);
     }
 
     /**
@@ -139,20 +194,30 @@ public class OddsFeedVerticle extends AbstractVerticle {
         log.warn("PROVIDER_SNAPSHOT_REQUESTED fromSequence={} note=simulated-resync", fromSequence);
     }
 
+    /**
+     * Retries in place first, so a broker blip does not cost a reconnect. If Kafka stays
+     * unavailable the error propagates and the pipeline restarts from the last acknowledged sequence.
+     */
     private Completable publish(SportsEvent event) {
         return publisher.publish(event)
+                .doOnError(error -> {
+                    metrics.oddsFeedPublishFailuresTotal.incrementAndGet();
+                    log.warn("KAFKA_PUBLISH_FAILED type={} version={} reason={}",
+                            event.type(), event.version(), error.getMessage());
+                })
+                .retryWhen(failures -> failures
+                        .zipWith(Flowable.range(1, PUBLISH_ATTEMPTS), (failure, attempt) -> attempt)
+                        .concatMap(attempt -> attempt < PUBLISH_ATTEMPTS
+                                ? Flowable.timer(200L << attempt, TimeUnit.MILLISECONDS, RxHelper.scheduler(vertx))
+                                : Flowable.error(new IllegalStateException(
+                                        "Kafka publish failed " + PUBLISH_ATTEMPTS + " times for version "
+                                                + event.version()))))
                 .doOnComplete(() -> {
                     metrics.oddsFeedEventsPublishedTotal.incrementAndGet();
                     log.info("{} eventId={} marketId={} version={} partitionKey={}",
                             event.type(), event.eventId(), marketIdOf(event),
                             event.version(), event.partitionKey());
-                })
-                .doOnError(error -> {
-                    metrics.oddsFeedPublishFailuresTotal.incrementAndGet();
-                    log.error("KAFKA_PUBLISH_FAILED type={} version={}", event.type(), event.version(), error);
-                })
-                // A single failed send must not tear down the long-lived provider stream.
-                .onErrorComplete();
+                });
     }
 
     /** Market id for market-scoped events; match-level events genuinely have none. */

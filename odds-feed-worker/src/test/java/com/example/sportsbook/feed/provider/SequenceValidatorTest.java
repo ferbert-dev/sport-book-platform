@@ -61,4 +61,26 @@ class SequenceValidatorTest {
 
         assertThat(validator.evaluate(501)).isEqualTo(SequenceDecision.IN_ORDER);
     }
+
+    @Test
+    void decideDoesNotRecordSoAFailedPublishIsAcceptedAgainOnReplay() {
+        SequenceValidator validator = new SequenceValidator();
+        validator.markProcessed(100);
+
+        // 101 arrives, its publish fails: decided but never marked.
+        assertThat(validator.decide(101)).isEqualTo(SequenceDecision.IN_ORDER);
+
+        // Replayed after reconnect: still in order, not a duplicate.
+        assertThat(validator.decide(101)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.lastProcessedSequence()).isEqualTo(100);
+    }
+
+    @Test
+    void markProcessedNeverMovesTheCursorBackwards() {
+        SequenceValidator validator = new SequenceValidator();
+        validator.markProcessed(200);
+        validator.markProcessed(150);
+
+        assertThat(validator.lastProcessedSequence()).isEqualTo(200);
+    }
 }

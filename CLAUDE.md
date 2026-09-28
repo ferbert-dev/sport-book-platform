@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 120 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 123 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -222,15 +222,20 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
 - **`provider-simulator` does not depend on `common-domain`.** The contract is the JSON on the wire;
   each side has its own `ProviderMessage`, as it would with a real vendor.
 - **`ProviderFeed` numbers the whole stream** with one sequence. `SequenceReservation` persists a
-  reserved block (hi/lo) to `SIMULATOR_SEQUENCE_FILE` before using it, so a restart always starts
-  above every sequence handed out — even after a clock rollback or a burst faster than 1 msg/ms.
+  reserved block (hi/lo) to `SIMULATOR_SEQUENCE_FILE` (temp file + atomic rename, one write at a
+  time) before using it, and the feed **fails closed** past the last durable block, so a restart
+  always starts above every sequence handed out — even after a clock rollback or a burst faster
+  than 1 msg/ms.
   The feed is confined to `SimulatorVerticle`'s context — everything that feeds it runs there, so it
   needs no locks.
 - **Resume, not just reconnect.** The feed keeps a replay window; the worker connects with
-  `?fromSequence=<cursor>` and gets what it missed before live traffic. The cursor is what this
-  process processed, or — right after startup — the highest `version` already on `sports-events`
-  (`LastPublishedSequence`), so a worker restart does not lose a `MARKET_RESULT` sent while it was
-  down. Replay and the live subscription happen in one event-loop turn, so nothing slips between.
+  `?fromSequence=<cursor>` (always — `0` when nothing is delivered yet) and gets what it missed
+  before live traffic. The cursor is the last sequence **Kafka acknowledged**: the worker marks a
+  sequence processed only after the publish succeeds, and a publish that keeps failing restarts the
+  pipeline so the provider replays it. Right after startup the cursor is the highest `version`
+  already on `sports-events` (`LastPublishedSequence`; an unreadable topic is retried, never read
+  as empty). Replay and the live subscription happen in one event-loop turn, so nothing slips
+  between.
 - `ScriptedMatch` loops a match lifecycle, injecting one duplicate and one gap per cycle so those
   paths run at runtime, not only in tests.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no

@@ -32,8 +32,9 @@ import java.util.function.LongSupplier;
  * instead of frames piling up in memory. The provider decides what to do with a worker that falls
  * behind (the simulator disconnects it).
  *
- * <p><b>Resume:</b> every (re)connect asks for {@code ?fromSequence=<last processed + 1>}, so the
- * provider replays what we missed while disconnected before live traffic resumes. Whatever the
+ * <p><b>Resume:</b> every (re)connect asks for {@code ?fromSequence=<last delivered + 1>}, so the
+ * provider replays what we missed while disconnected before live traffic resumes. With nothing
+ * delivered yet it asks for {@code fromSequence=0}: everything the provider still holds. Whatever the
  * provider can no longer replay still shows up in the worker's {@link SequenceValidator} as a gap,
  * which is why the validator must NOT be reset per connection.
  *
@@ -58,7 +59,7 @@ public class ProviderStreamClient {
      *                       has vanished waits out TCP's default (~60s in Vert.x) before the
      *                       backoff even starts.
      * @param lastProcessedSequence read on every connect to build the resume cursor; negative
-     *                              means nothing processed yet, so no cursor is sent
+     *                              means nothing delivered yet, so replay from the start
      */
     public ProviderStreamClient(Vertx vertx, String providerUrl, Duration connectTimeout,
                                 ReconnectBackoff backoff, AtomicLong unparseableFrames,
@@ -100,14 +101,19 @@ public class ProviderStreamClient {
                 .flatMapPublisher(socket -> socket.toFlowable()
                         .concatMapMaybe(this::decode)
                         .concatWith(Flowable.error(
-                                new IllegalStateException("provider closed the stream"))));
+                                new IllegalStateException("provider closed the stream")))
+                        // Cancelling a ReadStream only stops reading; it does not close the socket.
+                        // When the pipeline restarts, drop this connection before the next one opens.
+                        .doOnCancel(() -> socket.close().subscribe(() -> { }, error -> { })));
     }
 
-    static String resumeUrl(String providerUrl, long lastProcessed) {
-        if (lastProcessed < 0) {
-            return providerUrl;
-        }
-        return providerUrl + (providerUrl.contains("?") ? "&" : "?") + "fromSequence=" + (lastProcessed + 1);
+    /**
+     * Always carries a cursor. Asking for live-only would silently drop whatever the provider sent
+     * before this worker first connected, a settlement included.
+     */
+    static String resumeUrl(String providerUrl, long lastDelivered) {
+        long from = lastDelivered < 0 ? 0 : lastDelivered + 1;
+        return providerUrl + (providerUrl.contains("?") ? "&" : "?") + "fromSequence=" + from;
     }
 
     /** A malformed frame is logged and skipped; it must not tear down the connection. */

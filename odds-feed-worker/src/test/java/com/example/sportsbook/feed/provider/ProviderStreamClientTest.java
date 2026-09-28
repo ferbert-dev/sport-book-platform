@@ -7,9 +7,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ProviderStreamClientTest {
 
     @Test
-    void firstConnectHasNoCursorSoTheProviderSendsLiveTrafficOnly() {
+    void withNothingDeliveredYetItAsksForEverythingTheProviderStillHolds() {
         assertThat(ProviderStreamClient.resumeUrl("ws://p:8086/provider/stream", -1))
-                .isEqualTo("ws://p:8086/provider/stream");
+                .isEqualTo("ws://p:8086/provider/stream?fromSequence=0");
     }
 
     @Test

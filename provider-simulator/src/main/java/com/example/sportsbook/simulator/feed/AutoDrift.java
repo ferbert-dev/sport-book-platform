@@ -48,7 +48,9 @@ public final class AutoDrift implements Disposable {
         this.loop = Flowable.defer(() ->
                         Flowable.timer(this.range.sampleDelayMillis(), TimeUnit.MILLISECONDS, scheduler))
                 .repeat()
-                .subscribe(tick -> drift.run());
+                .subscribe(tick -> drift.run(),
+                        // e.g. SEQUENCE_RESERVATION_EXHAUSTED: stop drifting rather than crash the loop.
+                        error -> expire());
         restartLease();
     }
 

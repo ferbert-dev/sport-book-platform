@@ -16,6 +16,7 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.rxjava3.core.AbstractVerticle;
 import io.vertx.rxjava3.core.RxHelper;
+import io.vertx.core.file.CopyOptions;
 import io.vertx.rxjava3.core.buffer.Buffer;
 import io.vertx.rxjava3.core.http.HttpServer;
 import io.vertx.rxjava3.ext.web.Router;
@@ -56,6 +57,10 @@ public class SimulatorVerticle extends AbstractVerticle {
     private ManualMatchDirector director;
     private HttpServer server;
     private SequenceReservation reservation;
+    /** The reservation actually on disk; the feed never emits past it. */
+    private long durableUpTo;
+    /** One write at a time: two overlapping writes could land out of order. */
+    private boolean reservationWriteInFlight;
     private Disposable reservationKeeper;
     private ScriptedMatch scripted;
     private Disposable scriptedLoop;
@@ -76,7 +81,8 @@ public class SimulatorVerticle extends AbstractVerticle {
                         clock.millis(), persisted, SequenceReservation.DEFAULT_BLOCK))
                 .flatMapCompletable(started -> {
                     reservation = started;
-                    return persistReservation(started.reservedUpTo());
+                    return persistReservation(started.reservedUpTo())
+                            .doOnComplete(() -> durableUpTo = started.reservedUpTo());
                 })
                 .andThen(Completable.defer(() -> startFeedAndServer(clock)));
     }
@@ -89,21 +95,55 @@ public class SimulatorVerticle extends AbstractVerticle {
                                 .map(content -> OptionalLong.of(Long.parseLong(content.toString().trim()))));
     }
 
-    /** Async file write: never blocks the event loop the feed runs on. */
+    /**
+     * Async write to a temp file, then an atomic rename: never blocks the event loop the feed runs
+     * on, and a crash mid-write leaves the previous reservation intact instead of a torn file.
+     */
     private Completable persistReservation(long reservedUpTo) {
+        String temp = config.sequenceFile() + ".tmp";
         return vertx.fileSystem()
-                .rxWriteFile(config.sequenceFile(), Buffer.buffer(Long.toString(reservedUpTo)))
+                .rxWriteFile(temp, Buffer.buffer(Long.toString(reservedUpTo)))
+                .andThen(vertx.fileSystem().rxMove(temp, config.sequenceFile(),
+                        new CopyOptions().setAtomicMove(true).setReplaceExisting(true)))
                 .doOnComplete(() -> log.info("SEQUENCE_RESERVED reservedUpTo={} file={}",
                         reservedUpTo, config.sequenceFile()));
     }
 
+    /**
+     * Writes the newest proposed reservation if it is ahead of what is on disk, one write at a
+     * time, and only then raises the feed's emit limit. A failed write is retried; until one lands
+     * the feed keeps emitting inside the old durable block and fails closed at its end.
+     */
+    private void flushReservation() {
+        if (reservationWriteInFlight || reservation.reservedUpTo() <= durableUpTo) {
+            return;
+        }
+        long target = reservation.reservedUpTo();
+        reservationWriteInFlight = true;
+        persistReservation(target).subscribe(
+                () -> {
+                    durableUpTo = target;
+                    feed.setEmitLimit(target);
+                    reservationWriteInFlight = false;
+                    flushReservation();
+                },
+                error -> {
+                    reservationWriteInFlight = false;
+                    log.error("SEQUENCE_RESERVATION_WRITE_FAILED reservedUpTo={} durableUpTo={} retryInMs=1000",
+                            target, durableUpTo, error);
+                    vertx.setTimer(1_000, id -> flushReservation());
+                });
+    }
+
     private Completable startFeedAndServer(Clock clock) {
         feed = new ProviderFeed(reservation.start(), clock);
-        // Reserve the next block while half of the current one is still unused.
-        reservationKeeper = feed.messages().subscribe(message ->
-                reservation.extendIfNeeded(feed.lastSequence()).ifPresent(next ->
-                        persistReservation(next).subscribe(() -> { },
-                                error -> log.error("SEQUENCE_RESERVATION_WRITE_FAILED reservedUpTo={}", next, error))));
+        feed.setEmitLimit(durableUpTo);
+        // Propose the next block while half of the current one is still unused; flushReservation
+        // makes it durable before the feed is allowed to use it.
+        reservationKeeper = feed.messages().subscribe(message -> {
+            reservation.extendIfNeeded(feed.lastSequence());
+            flushReservation();
+        });
         director = new ManualMatchDirector(feed, java.util.Set.of(config.scriptedMarketId()));
         // Created even with autoplay off, so POST /dev/scripted/start can switch it on later.
         scripted = new ScriptedMatch(config.scriptedEventId(), config.scriptedMarketId());
