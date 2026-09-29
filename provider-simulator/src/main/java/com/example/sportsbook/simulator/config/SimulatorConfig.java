@@ -21,8 +21,9 @@ public record SimulatorConfig(
                 Duration.ofMillis(Long.parseLong(env("PROVIDER_INTERVAL_MS", "2000"))),
                 env("DEMO_EVENT_ID", "event-123"),
                 env("DEMO_MARKET_ID", "market-456"),
-                // Turn off to drive matches purely from the dev panel with no scripted noise.
-                Boolean.parseBoolean(env("FEED_AUTOPLAY", "true")),
+                // Off by default: matches start only when someone starts one from the dev panel.
+                // "true" runs the looping scripted match in the background.
+                Boolean.parseBoolean(env("FEED_AUTOPLAY", "false")),
                 // Where the sequence reservation survives restarts; see SequenceReservation.
                 env("SIMULATOR_SEQUENCE_FILE", ".provider-simulator-sequence")
         );
