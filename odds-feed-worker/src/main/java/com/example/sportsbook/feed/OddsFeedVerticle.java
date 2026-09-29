@@ -1,5 +1,6 @@
 package com.example.sportsbook.feed;
 
+import com.example.sportsbook.common.MarketSuspendedEvent;
 import com.example.sportsbook.common.SportsEvent;
 import com.example.sportsbook.feed.config.FeedConfig;
 import com.example.sportsbook.feed.messaging.LastPublishedSequence;
@@ -11,6 +12,8 @@ import com.example.sportsbook.feed.provider.ProviderStreamClient;
 import com.example.sportsbook.feed.provider.ReconnectBackoff;
 import com.example.sportsbook.feed.provider.SequenceDecision;
 import com.example.sportsbook.feed.provider.SequenceValidator;
+import com.example.sportsbook.feed.safety.ActiveMarkets;
+import com.example.sportsbook.feed.safety.GapSuspension;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Maybe;
@@ -20,6 +23,8 @@ import io.vertx.rxjava3.core.RxHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -49,6 +54,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
     private final FeedConfig config;
     private final FeedMetrics metrics = new FeedMetrics();
     private final SequenceValidator sequenceValidator = new SequenceValidator();
+    private final ActiveMarkets activeMarkets = new ActiveMarkets();
 
     /** Resume point for a freshly started process, read from Kafka before the first connect. */
     private long lastPublishedAtStartup = -1;
@@ -133,14 +139,46 @@ public class OddsFeedVerticle extends AbstractVerticle {
             // still goes through the gap check against the last acknowledged sequence.
             return Completable.complete();
         }
-        if (!acceptSequence(message)) {
+        SequenceOutcome outcome = checkSequence(message);
+        if (outcome == SequenceOutcome.SKIP) {
             return Completable.complete();
         }
-        return Maybe.fromOptional(MessageNormalizer.normalize(message))
-                .flatMapCompletable(this::publish)
+        // FIX 3: after a gap, close every active market BEFORE publishing the message that
+        // revealed it. That message still goes out: dropping it would lose real state on top of
+        // the gap, and if it is the provider's own MARKET_UNLOCK its higher version reopens.
+        Completable suspensions = outcome == SequenceOutcome.PROCESS_AFTER_GAP
+                ? suspendActiveMarkets(sequence)
+                : Completable.complete();
+        return suspensions
+                .andThen(Maybe.fromOptional(MessageNormalizer.normalize(message))
+                        .flatMapCompletable(event -> publish(event)
+                                .doOnComplete(() -> activeMarkets.track(event))))
                 // Only now, with Kafka's ack in hand, is the sequence delivered.
                 .doOnComplete(() -> sequenceValidator.markProcessed(sequence));
     }
+
+    /**
+     * FIX 3: one MARKET_SUSPENDED per active market, versioned just below the message that revealed
+     * the gap (see {@link GapSuspension} for why that version is both high and low enough). The
+     * snapshot is taken at subscription, so a pipeline retry suspends whatever is active then.
+     */
+    private Completable suspendActiveMarkets(long receivedSequence) {
+        return Completable.defer(() -> {
+            List<MarketSuspendedEvent> suspensions =
+                    GapSuspension.suspendAll(activeMarkets.snapshot(), receivedSequence, Instant.now());
+            if (suspensions.isEmpty()) {
+                return Completable.complete();
+            }
+            log.warn("MARKETS_SUSPENDED_ON_GAP markets={} version={} receivedSequence={}",
+                    suspensions.size(), receivedSequence - 1, receivedSequence);
+            metrics.oddsFeedGapSuspensionsTotal.addAndGet(suspensions.size());
+            return Flowable.fromIterable(suspensions)
+                    .concatMapCompletable(suspension -> publish(suspension)
+                            .doOnComplete(() -> activeMarkets.track(suspension)));
+        });
+    }
+
+    private enum SequenceOutcome { SKIP, PROCESS, PROCESS_AFTER_GAP }
 
     private boolean validate(ProviderMessage message) {
         if (ProviderMessageValidator.isValid(message)) {
@@ -152,7 +190,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
         return false;
     }
 
-    private boolean acceptSequence(ProviderMessage message) {
+    private SequenceOutcome checkSequence(ProviderMessage message) {
         long sequence = message.sequenceNumber();
         SequenceDecision decision = sequenceValidator.decide(sequence);
 
@@ -162,20 +200,20 @@ public class OddsFeedVerticle extends AbstractVerticle {
         if (sequenceValidator.lastProcessedSequence() < 0 && lastPublishedAtStartup >= 0
                 && sequence > lastPublishedAtStartup + 1) {
             reportGap(lastPublishedAtStartup + 1, sequence);
+            return SequenceOutcome.PROCESS_AFTER_GAP;
         }
 
         return switch (decision) {
-            case IN_ORDER -> true;
+            case IN_ORDER -> SequenceOutcome.PROCESS;
             case DUPLICATE -> {
                 metrics.oddsFeedDuplicatesTotal.incrementAndGet();
                 log.info("PROVIDER_DUPLICATE_IGNORED sequenceNumber={} lastProcessedSequence={}",
                         sequence, sequenceValidator.lastProcessedSequence());
-                yield false;
+                yield SequenceOutcome.SKIP;
             }
             case GAP -> {
                 reportGap(sequenceValidator.lastProcessedSequence() + 1, sequence);
-                // Still process the message: dropping it would lose real state on top of the gap.
-                yield true;
+                yield SequenceOutcome.PROCESS_AFTER_GAP;
             }
         };
     }

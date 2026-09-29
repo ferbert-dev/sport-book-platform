@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 124 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 129 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -240,6 +240,12 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   event on load: matches start from the dev panel. `ScriptedMatch` (`event-123`) is opt-in —
   `FEED_AUTOPLAY=true` or `POST /dev/scripted/start` — and loops a match lifecycle, injecting one
   duplicate and one gap per cycle so those paths run at runtime, not only in tests.
+- **A gap suspends every active market** (`GapSuspension`, `MARKETS_SUSPENDED_ON_GAP`): a lost
+  `MARKET_LOCK` would otherwise leave a market `ACTIVE` while prices keep flowing past the staleness
+  sweep. The synthetic `MARKET_SUSPENDED` is versioned `receivedSequence - 1` — above everything
+  stored for the market, below the provider's next message — so the provider's own `MARKET_UNLOCK`
+  still reopens it. `ActiveMarkets` is in memory and built from acknowledged publishes only; the
+  worker never reads Redis to rebuild it.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
   longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
   numbering ever restarted lower, a seeded validator would drop everything as duplicates.

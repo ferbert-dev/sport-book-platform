@@ -14,6 +14,8 @@ public class FeedMetrics {
     public final AtomicLong oddsFeedSequenceGapsTotal = new AtomicLong();
     public final AtomicLong oddsFeedEventsPublishedTotal = new AtomicLong();
     public final AtomicLong oddsFeedPublishFailuresTotal = new AtomicLong();
+    /** FIX 3: markets suspended because a sequence gap may have hidden their MARKET_LOCK. */
+    public final AtomicLong oddsFeedGapSuspensionsTotal = new AtomicLong();
 
     public String snapshot() {
         return "odds_feed_messages_received_total=" + oddsFeedMessagesReceivedTotal.get()
@@ -21,6 +23,7 @@ public class FeedMetrics {
                 + " odds_feed_duplicates_total=" + oddsFeedDuplicatesTotal.get()
                 + " odds_feed_sequence_gaps_total=" + oddsFeedSequenceGapsTotal.get()
                 + " odds_feed_events_published_total=" + oddsFeedEventsPublishedTotal.get()
-                + " odds_feed_publish_failures_total=" + oddsFeedPublishFailuresTotal.get();
+                + " odds_feed_publish_failures_total=" + oddsFeedPublishFailuresTotal.get()
+                + " odds_feed_gap_suspensions_total=" + oddsFeedGapSuspensionsTotal.get();
     }
 }
