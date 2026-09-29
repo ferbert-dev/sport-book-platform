@@ -101,6 +101,8 @@
       <label for="eventId">Event</label>
       <input id="eventId" value="event-123" size="16">
       <button id="syncBtn">Track event</button>
+      <button id="stopEventBtn"
+              title="Stop all simulated traffic for this event id: the scripted loop or a running auto-drift. Does not settle it.">Stop event</button>
       <button id="wsBtn" class="primary">Connect</button>
       <span style="margin-left:auto" class="meta">
         <span id="wsDot" class="dot off"></span> <span id="wsState">disconnected</span>
@@ -111,8 +113,18 @@
   <div class="panel">
     <h2>Dev panel &mdash; drive the feed by hand</h2>
     <div class="row">
-      <button id="newMatchBtn" class="primary">Start random match</button>
+      <input id="newEventId" placeholder="new event id (optional)" size="20" maxlength="64"
+             pattern="[A-Za-z0-9_-]{1,64}"
+             title="Letters, digits, - and _. Leave empty for a generated id. The market id is derived: event-777 → market-777, derby → market-derby.">
+      <button id="newMatchBtn" class="primary">Start match</button>
       <button id="driftBtn" disabled>Move odds</button>
+      <button id="autoDriftBtn" disabled>Auto-drift: off</button>
+      <input id="autoDriftMin" type="number" value="1000" min="10" step="10" disabled
+             style="width:78px" title="shortest gap between automatic drifts, in milliseconds">
+      <span class="meta">&ndash;</span>
+      <input id="autoDriftMax" type="number" value="4000" min="10" step="10" disabled
+             style="width:78px" title="longest gap; set equal to the minimum for a fixed cadence">
+      <label for="autoDriftMax">ms</label>
       <button id="suspendBtn" disabled>Suspend market</button>
       <button id="openBtn" disabled>Open market</button>
       <span style="width:12px"></span>
@@ -121,9 +133,16 @@
       <button id="settleBtn" disabled>Finish &amp; settle</button>
     </div>
     <p class="note">
-      Creates a match with random teams and prices on <code>sports-events</code> through the normal
-      publisher, so the rest of the system cannot tell it from provider traffic. Use this instead of
-      waiting for the scripted loop's ~4&nbsp;second bettable window.
+      <strong>Start match</strong> creates a match under the id you type (or a generated one if the
+      field is empty) with random teams and prices on the <strong>provider simulator</strong>, which
+      streams it to the feed worker like any provider traffic, so the rest of the system cannot tell
+      the two apart. Use this instead of waiting for the scripted loop's ~4&nbsp;second bettable window.
+      <br><strong>Auto-drift</strong> makes the simulator itself keep moving prices, waiting a random
+      gap in the given range (10&nbsp;ms&ndash;60&nbsp;s) each time &mdash; a real feed does not tick on
+      a metronome. Equal min and max give a fixed cadence. It runs only while the dev match is the event
+      being tracked <em>with live updates confirmed</em>, and stops on settlement, on a dropped or
+      unconfirmed stream, or when you track something else. The page renews it every 2&nbsp;s; close the
+      tab and the simulator stops it within 5&nbsp;s &mdash; a demo should never leave traffic running unwatched.
     </p>
   </div>
 
@@ -333,6 +352,11 @@
    */
   async function syncTo(eventId) {
     if (!eventId) return;
+
+    // Drifting a match we have stopped watching is invisible background traffic — exactly
+    // what the dev panel exists to avoid.
+    if (autoDrift.eventId && autoDrift.eventId !== eventId) stopAutoDrift(`now tracking ${eventId}`);
+
     const gen = ++state.syncSeq;
     try {
       const ws = await ensureSocket();
@@ -367,12 +391,18 @@
 
       // A timeout, a close, or a send() that threw all resolve false. Treating those as
       // a successful subscription would leave a frozen snapshot masquerading as live.
-      setLive(acked);
+      // Except: frames for THIS event already arrived while we waited (liveConfirmed was reset
+      // to false above, so only this subscription's data can have set it). That is stronger
+      // proof than the ack, so a late ack timeout must not downgrade it.
+      const provenByFrames = !acked && state.liveConfirmed;
+      if (!provenByFrames) setLive(acked);
       log(acked
             ? `SUBSCRIBE ${eventId} acked (buffering until snapshot)`
-            : `SUBSCRIBE ${eventId} NOT confirmed — showing a snapshot, but live updates `
-              + `are not guaranteed. Press "Track event" to retry.`,
-          acked ? "sys" : "err");
+            : provenByFrames
+              ? `SUBSCRIBE ${eventId} ack timed out, but live frames already arrived — treating as live`
+              : `SUBSCRIBE ${eventId} NOT confirmed — showing a snapshot, but live updates `
+                + `are not guaranteed. Press "Track event" to retry.`,
+          acked || provenByFrames ? "sys" : "err");
 
       await loadSnapshot(eventId, gen);
       if (gen !== state.syncSeq) return;
@@ -407,7 +437,7 @@
       // Settlement is a terminal fact, not a projection update: resolve regardless of
       // whether the version guard moved local state, or a settlement that landed during
       // the buffer window would never credit the payout.
-      if (ev.type === "MARKET_SETTLED") resolveBets(ev);
+      if (ev.type === "MARKET_SETTLED") { resolveBets(ev); stopAutoDriftOnSettle(ev); }
     }
     if (held.length) {
       log(`drained ${held.length} buffered frame(s), ${applied} newer than snapshot`, "sys");
@@ -454,7 +484,7 @@
     // Redelivery is expected under at-least-once, and the version guard discards it.
     // Settling must not depend on that guard: resolveBets is idempotent per bet, so a
     // duplicate cannot double-credit, but skipping it would silently lose the payout.
-    if (msg.type === "MARKET_SETTLED") resolveBets(msg);
+    if (msg.type === "MARKET_SETTLED") { resolveBets(msg); stopAutoDriftOnSettle(msg); }
     if (applied) render();
   }
 
@@ -702,20 +732,24 @@
       body: body ? JSON.stringify(body) : undefined,
     });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+    if (!res.ok) throw new Error(json.message || json.error || `HTTP ${res.status}`);
     return json;
   }
 
   function setDevEnabled(on) {
-    for (const id of ["driftBtn", "suspendBtn", "openBtn", "settleBtn", "winnerSel"]) {
+    for (const id of ["driftBtn", "autoDriftBtn", "autoDriftMin", "autoDriftMax",
+                      "suspendBtn", "openBtn", "settleBtn", "winnerSel"]) {
       $(id).disabled = !on;
     }
   }
 
   async function newMatch() {
     $("newMatchBtn").disabled = true;
+    stopAutoDrift("new match requested");
+    const requested = $("newEventId").value.trim();
     try {
-      const match = await dev("/matches");
+      const match = await dev("/matches", "POST", requested ? { eventId: requested } : undefined);
+      $("newEventId").value = "";
       state.devMatch = match.eventId;
       $("eventId").value = match.eventId;
       log(`dev: created ${match.eventId} / ${match.marketId}`, "sys");
@@ -729,14 +763,166 @@
   }
 
   async function devAction(path, label, body) {
-    if (!state.devMatch) return;
+    if (!state.devMatch) return false;
     try {
       await dev(`/matches/${encodeURIComponent(state.devMatch)}${path}`, "POST", body);
       log(`dev: ${label}`, "sys");
+      return true;
     } catch (e) {
       log(`dev: ${label} failed — ${e.message}`, "err");
+      return false;
     }
   }
+
+  // ---------------------------------------------------------------- auto-drift
+  /**
+   * Auto-drift runs IN THE PROVIDER SIMULATOR, not here: the provider is what sends the feed,
+   * and a browser timer cannot go below a few hundred ms or survive a busy tab. This page only
+   * switches it on and off.
+   *
+   * The simulator holds it on a lease, so the page renews it on a heartbeat. Each heartbeat
+   * first re-asks autoDriftBlocker(): the moment the stream drops or another event is tracked
+   * the page stops the drift, and if the page itself goes away the lease simply runs out.
+   */
+  const RENEW_EVERY_MS = 2000;
+  const autoDrift = { heartbeat: null, eventId: null };
+
+  const autoDriftRunning = () => autoDrift.heartbeat !== null;
+
+  // The simulator enforces 10 ms..60 s; clamping here just keeps the request valid.
+  const clampMs = (raw, fallback) => {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.min(60000, Math.max(10, Math.floor(n))) : fallback;
+  };
+
+  /**
+   * Read on every heartbeat, so editing either field takes effect within 2 s.
+   *
+   * A max below the min means "fixed cadence" rather than an error to police — equal values
+   * are the normal way to ask for a steady beat.
+   */
+  function driftRange() {
+    const lo = clampMs($("autoDriftMin").value, 2000);
+    return { lo, hi: Math.max(lo, clampMs($("autoDriftMax").value, lo)) };
+  }
+
+  function describeDriftRange() {
+    const { lo, hi } = driftRange();
+    return hi === lo ? `every ${lo}ms` : `every ${lo}\u2013${hi}ms, random`;
+  }
+
+  /**
+   * Why auto-drift may not run, as a sentence, or null when it may.
+   *
+   * Both the start and the heartbeat path ask this one question, so they cannot disagree:
+   * checking only state.devMatch lets the drift be restarted for a match we stopped tracking,
+   * because devMatch outlives the subscription and the dev buttons stay enabled.
+   *
+   * liveConfirmed, not subscribedEventId, is the real test. subscribedEventId only records
+   * that SUBSCRIBE was sent — syncTo sets it optimistically and it survives a lost ack, so a
+   * frozen snapshot would satisfy it. The page already keeps the stronger fact (the ack, or
+   * arriving data self-healing it) and refuses to call anything live without it; drift must
+   * hold to the same bar, or it publishes prices into a stream nobody is receiving.
+   */
+  function autoDriftBlocker() {
+    if (!state.devMatch) return 'no dev match — press "Start match"';
+    if (state.devMatch !== state.subscribedEventId) {
+      return `${state.devMatch} is not the tracked event — put it in the Event box `
+           + `and press "Track event"`;
+    }
+    if (!state.liveConfirmed) {
+      return `live updates for ${state.devMatch} are not confirmed — press "Track event" to retry`;
+    }
+    return null;
+  }
+
+  function renderAutoDrift() {
+    const btn = $("autoDriftBtn");
+    const on = autoDriftRunning();
+    btn.textContent = on ? "Auto-drift: on" : "Auto-drift: off";
+    btn.classList.toggle("primary", on);
+  }
+
+  /** Starts or renews the simulator-side drift; the same call is the heartbeat. */
+  function requestAutoDrift(eventId) {
+    const { lo, hi } = driftRange();
+    return dev(`/matches/${encodeURIComponent(eventId)}/auto-drift`, "POST", { minMs: lo, maxMs: hi });
+  }
+
+  function stopAutoDrift(why) {
+    if (!autoDriftRunning()) return;
+    clearInterval(autoDrift.heartbeat);
+    autoDrift.heartbeat = null;
+    const eventId = autoDrift.eventId;
+    autoDrift.eventId = null;
+    renderAutoDrift();
+    // Best effort: if this fails the lease still stops the drift within a few seconds.
+    dev(`/matches/${encodeURIComponent(eventId)}/auto-drift`, "DELETE").catch(() => {});
+    if (why) log(`dev: auto-drift stopped — ${why}`, "sys");
+  }
+
+  /**
+   * A settled market has no more prices to move. The simulator stops the drift itself on
+   * settlement; this just brings the button back in line when MARKET_SETTLED arrives.
+   */
+  function stopAutoDriftOnSettle(ev) {
+    if (autoDrift.eventId && ev.eventId === autoDrift.eventId) {
+      stopAutoDrift(`${ev.marketId} settled`);
+    }
+  }
+
+  async function startAutoDrift() {
+    if (autoDriftRunning()) return;
+
+    const blocked = autoDriftBlocker();
+    if (blocked) { log(`dev: auto-drift not started — ${blocked}`, "err"); return; }
+
+    const eventId = state.devMatch;
+    try {
+      await requestAutoDrift(eventId);
+    } catch (e) {
+      log(`dev: auto-drift not started — ${e.message}`, "err");
+      return;
+    }
+
+    autoDrift.eventId = eventId;
+    autoDrift.heartbeat = setInterval(async () => {
+      const blocker = autoDriftBlocker();
+      if (blocker) { stopAutoDrift(blocker); return; }
+      // Not covered by the blocker: a NEW dev match that is itself tracked and live.
+      if (autoDrift.eventId !== state.devMatch) { stopAutoDrift("dev match changed"); return; }
+      try {
+        await requestAutoDrift(eventId);
+      } catch (e) {
+        if (autoDrift.eventId === eventId) stopAutoDrift(`renew failed — ${e.message}`);
+      }
+    }, RENEW_EVERY_MS);
+    renderAutoDrift();
+    log(`dev: auto-drift on in the simulator, ${describeDriftRange()}`, "sys");
+  }
+
+  /**
+   * Stops whatever the simulator is generating for the event in the Event box — the scripted
+   * loop for the scripted event, or auto-drift for a dev match. Stopping is not settling: the
+   * event keeps its last state, and the staleness sweep suspends its market once prices go stale.
+   */
+  async function stopEvent() {
+    const eventId = $("eventId").value.trim();
+    if (!eventId) return;
+    try {
+      const res = await dev(`/events/${encodeURIComponent(eventId)}/stop`);
+      log(res.stopped.length
+            ? `dev: stopped ${eventId} — ${res.stopped.join(", ")}`
+            : `dev: ${eventId} had nothing running`, "sys");
+    } catch (e) {
+      log(`dev: stop ${eventId} failed — ${e.message}`, "err");
+    }
+    // The server already stopped any drift; this only brings the button back in line.
+    if (autoDrift.eventId === eventId) stopAutoDrift(null);
+  }
+
+  const toggleAutoDrift = () =>
+    autoDriftRunning() ? stopAutoDrift("switched off") : startAutoDrift();
 
   // ---------------------------------------------------------------- helpers
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
@@ -745,12 +931,20 @@
 
   $("syncBtn").onclick  = () => syncTo($("eventId").value.trim());
   $("wsBtn").onclick    = toggleStream;
+  $("stopEventBtn").onclick = stopEvent;
   $("newMatchBtn").onclick = newMatch;
+  $("newEventId").onkeydown = (e) => { if (e.key === "Enter") newMatch(); };
   $("driftBtn").onclick    = () => devAction("/odds", "moved odds");
+  $("autoDriftBtn").onclick = toggleAutoDrift;
   $("suspendBtn").onclick  = () => devAction("/suspend", "suspended market");
   $("openBtn").onclick     = () => devAction("/open", "opened market");
-  $("settleBtn").onclick   = () => devAction("/settle", "finished & settled",
-                                  { winningSelectionId: $("winnerSel").value || null });
+  $("settleBtn").onclick   = () => {
+    // The simulator also stops the drift before it publishes the result, so no price can
+    // outrank the settlement's version; this just updates the button straight away.
+    stopAutoDrift("match settled");
+    devAction("/settle", "finished & settled",
+              { winningSelectionId: $("winnerSel").value || null });
+  };
   $("topUpBtn").onclick = () => { state.balance += 500; log("top-up +500.00", "money"); renderBalance(); };
   $("resetBtn").onclick = () => {
     state.balance = START_BALANCE; state.openBets = [];
@@ -758,6 +952,7 @@
   };
 
   renderBalance();
+  renderAutoDrift();
   syncTo($("eventId").value.trim());
 })();
 </script>

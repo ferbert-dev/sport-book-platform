@@ -1,32 +1,23 @@
-package com.example.sportsbook.feed.provider;
+package com.example.sportsbook.simulator.feed;
 
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * A match created on demand through the dev control API.
- *
- * <p>Each one carries its own sequence counter. Versions only need to be monotonic per
- * market/event key — which is exactly how the downstream version guard is scoped — so independent
- * matches can number themselves independently without colliding.
+ * A match created on demand through the dev control API. Sequence numbers are not tracked here:
+ * the {@link ProviderFeed} numbers every message on the stream.
  */
 public class ManualMatch {
 
     private final String eventId;
     private final String marketId;
     private final Map<String, BigDecimal> odds = new LinkedHashMap<>();
-
-    private long sequence = 1000L;
     private boolean settled;
 
     public ManualMatch(String eventId, String marketId) {
         this.eventId = eventId;
         this.marketId = marketId;
-    }
-
-    public long nextVersion() {
-        return ++sequence;
     }
 
     public String eventId() {

@@ -10,21 +10,22 @@
     <version>1.0.0-SNAPSHOT</version>
   </parent>
 
-  <artifactId>odds-feed-worker</artifactId>
+  <artifactId>provider-simulator</artifactId>
   <packaging>jar</packaging>
-  <name>odds-feed-worker</name>
-  <description>Pure Vert.x + RxJava worker: provider WebSocket feed -> normalize -> Kafka sports-events. No Spring Boot.</description>
+  <name>provider-simulator</name>
+  <description>Dev-only stand-in for an external sports data provider: streams provider messages over
+    WebSocket and exposes the /dev control API. Pure Vert.x + RxJava. Not part of the platform.</description>
 
   <properties>
-    <main.class>com.example.sportsbook.feed.OddsFeedWorkerMain</main.class>
+    <main.class>com.example.sportsbook.simulator.ProviderSimulatorMain</main.class>
   </properties>
 
+  <!--
+    Deliberately does NOT depend on common-domain: a real provider knows nothing about our
+    domain events. The only contract between simulator and odds-feed-worker is the JSON on
+    the wire, in the provider's own vocabulary.
+  -->
   <dependencies>
-    <dependency>
-      <groupId>com.example.sportsbook</groupId>
-      <artifactId>common-domain</artifactId>
-    </dependency>
-
     <dependency>
       <groupId>io.vertx</groupId>
       <artifactId>vertx-core</artifactId>
@@ -35,11 +36,20 @@
     </dependency>
     <dependency>
       <groupId>io.vertx</groupId>
-      <artifactId>vertx-kafka-client</artifactId>
+      <artifactId>vertx-web</artifactId>
     </dependency>
     <dependency>
       <groupId>io.reactivex.rxjava3</groupId>
       <artifactId>rxjava</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
     </dependency>
 
     <dependency>
@@ -59,11 +69,6 @@
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.mockito</groupId>
-      <artifactId>mockito-core</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

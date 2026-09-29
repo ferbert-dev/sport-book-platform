@@ -12,17 +12,34 @@ public class SequenceValidator {
 
     private long lastProcessedSequence = NOT_STARTED;
 
+    /** Decides and marks processed in one step. */
     public SequenceDecision evaluate(long incomingSequence) {
+        SequenceDecision decision = decide(incomingSequence);
+        if (decision != SequenceDecision.DUPLICATE) {
+            markProcessed(incomingSequence);
+        }
+        return decision;
+    }
+
+    /**
+     * Classifies a sequence without recording it. The worker marks a sequence processed only once
+     * Kafka has acknowledged it, so a failed publish is asked for again on reconnect instead of
+     * being skipped.
+     */
+    public SequenceDecision decide(long incomingSequence) {
         if (lastProcessedSequence == NOT_STARTED) {
-            lastProcessedSequence = incomingSequence;
             return SequenceDecision.IN_ORDER;
         }
         if (incomingSequence <= lastProcessedSequence) {
             return SequenceDecision.DUPLICATE;
         }
-        boolean gap = incomingSequence > lastProcessedSequence + 1;
-        lastProcessedSequence = incomingSequence;
-        return gap ? SequenceDecision.GAP : SequenceDecision.IN_ORDER;
+        return incomingSequence > lastProcessedSequence + 1 ? SequenceDecision.GAP : SequenceDecision.IN_ORDER;
+    }
+
+    public void markProcessed(long sequence) {
+        if (sequence > lastProcessedSequence) {
+            lastProcessedSequence = sequence;
+        }
     }
 
     public long lastProcessedSequence() {
