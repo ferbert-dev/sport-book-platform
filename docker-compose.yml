@@ -312,9 +312,10 @@ services:
       PROVIDER_INTERVAL_MS: "2000"
       DEMO_EVENT_ID: event-123
       DEMO_MARKET_ID: market-456
-      # Scripted loop stays on; the dev panel creates independent matches alongside it.
-      # Set to "false" to drive everything by hand with no background traffic.
-      FEED_AUTOPLAY: "true"
+      # Off: no match runs until you start one from the dev panel. Set to "true" for the
+      # looping scripted match (event-123) in the background, or start it on demand with
+      # POST /dev/scripted/start.
+      FEED_AUTOPLAY: "false"
       # Sequence reservation survives container recreation, so versions never go backwards.
       SIMULATOR_SEQUENCE_FILE: /data/sequence
     volumes:

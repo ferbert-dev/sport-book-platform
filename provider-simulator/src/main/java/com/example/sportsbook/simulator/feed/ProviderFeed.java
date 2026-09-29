@@ -37,9 +37,9 @@ public final class ProviderFeed {
     private ProviderMessage lastEmitted;
 
     /**
-     * @param startSequence last sequence considered already used. Seed it from the wall clock so a
-     *                      restarted simulator keeps moving forward instead of replaying numbers the
-     *                      version guard has already seen.
+     * @param startSequence last sequence considered already used. Seed it from a
+     *                      {@link SequenceReservation} so a restarted simulator keeps moving forward
+     *                      instead of replaying numbers the version guard has already seen.
      */
     public ProviderFeed(long startSequence, Clock clock) {
         this(startSequence, clock, 10_000);

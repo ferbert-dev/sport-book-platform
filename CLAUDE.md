@@ -236,8 +236,10 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   already on `sports-events` (`LastPublishedSequence`; an unreadable topic is retried, never read
   as empty). Replay and the live subscription happen in one event-loop turn, so nothing slips
   between.
-- `ScriptedMatch` loops a match lifecycle, injecting one duplicate and one gap per cycle so those
-  paths run at runtime, not only in tests.
+- **Nothing starts on its own.** `FEED_AUTOPLAY` defaults to `false` and the demo page tracks no
+  event on load: matches start from the dev panel. `ScriptedMatch` (`event-123`) is opt-in —
+  `FEED_AUTOPLAY=true` or `POST /dev/scripted/start` — and loops a match lifecycle, injecting one
+  duplicate and one gap per cycle so those paths run at runtime, not only in tests.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
   longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
   numbering ever restarted lower, a seeded validator would drop everything as duplicates.

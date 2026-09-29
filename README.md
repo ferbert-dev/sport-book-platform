@@ -542,8 +542,12 @@ docker compose up -d --build  # infrastructure, all six services, the provider s
 
 Then open **<http://localhost:8080>**.
 
-That is the whole demo: the feed worker starts producing, the projection fills, and a bet placed
-against `localhost:8084` settles automatically. Ports `8081`–`8085`, `9092`, `6379` and `5432` are
+Nothing runs until you start it: press **Start match** in the dev panel, and the simulator streams
+that match through the feed worker, the projection fills, and a bet on it settles when you press
+**Finish & settle**. For a looping scripted match in the background instead, set
+`FEED_AUTOPLAY: "true"` on `provider-simulator`, or start it once with
+`curl -X POST localhost:8080/dev/scripted/start` (it runs as `event-123`, which the curl examples
+below use). Ports `8081`–`8085`, `9092`, `6379` and `5432` are
 published to the host, so the curl and WebSocket examples below work unchanged.
 
 #### The demo UI
@@ -565,10 +569,9 @@ It exists to make the SNAPSHOT + STREAM pattern visible rather than to be a real
 - *Retry last* reuses the previous `idempotencyKey`, so the server returns the same `betId` rather
   than creating a second bet
 
-The bet window is short by design: the scripted match settles every ~20s, and the market is only
-`ACTIVE` between `MARKET_OPENED` and `MATCH_FINISHED`. Raise `PROVIDER_INTERVAL_MS` on
-`provider-simulator` in `docker-compose.yml` to widen it, or create a match from the dev panel,
-which stays open until you settle it.
+A dev-panel match stays bettable until you settle it. The optional scripted match is different:
+it settles every ~20s and its market is only `ACTIVE` between `MARKET_OPENED` and
+`MATCH_FINISHED`; raise `PROVIDER_INTERVAL_MS` on `provider-simulator` to widen that window.
 
 ```bash
 docker compose ps                                  # health of every service
@@ -645,8 +648,9 @@ modules in the local repository first, and it must be run **without `-am`**:
 > of which has a main class. Dropping `-am` restricts the reactor to the one module — which is why
 > the `install` step above is needed to supply `common-domain`.
 
-Once connected, the feed worker receives the simulator's scripted match, which loops through the
-match lifecycle, ending in `MARKET_SETTLED` — which triggers settlement.
+Once connected, the feed worker streams whatever the simulator emits. Start a match from the dev
+panel (`POST /dev/matches`) or the scripted loop (`POST /dev/scripted/start`); settling it ends in
+`MARKET_SETTLED`, which triggers settlement.
 
 ### Useful Maven commands
 
@@ -676,7 +680,7 @@ All services read environment variables, with local defaults:
 | `PROVIDER_RECONNECT_INITIAL_MS` / `PROVIDER_RECONNECT_MAX_MS` (feed worker) | `500` / `30000` |
 | `SIMULATOR_PORT` (simulator) | `8086` |
 | `PROVIDER_INTERVAL_MS` (simulator) | `2000` |
-| `FEED_AUTOPLAY` (simulator) | `true` — set `false` to drive matches only from the dev panel |
+| `FEED_AUTOPLAY` (simulator) | `false` — nothing runs until started from the dev panel; `true` loops the scripted match |
 | `SIMULATOR_SEQUENCE_FILE` (simulator) | `.provider-simulator-sequence` — the persisted sequence reservation (`/data/sequence` in Docker) |
 
 ---
