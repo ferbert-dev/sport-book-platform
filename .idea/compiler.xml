@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Maven default annotation processors profile" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <module name="state-processor" />
+        <module name="odds-feed-worker" />
+        <module name="realtime-gateway" />
+        <module name="provider-simulator" />
+        <module name="common-domain" />
+        <module name="bet-service" />
+        <module name="settlement-service" />
+        <module name="odds-service" />
+      </profile>
+    </annotationProcessing>
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="bet-service" options="-parameters" />
+      <module name="common-domain" options="-parameters" />
+      <module name="live-sportsbook" options="-parameters" />
+      <module name="odds-feed-worker" options="-parameters" />
+      <module name="odds-service" options="-parameters" />
+      <module name="provider-simulator" options="-parameters" />
+      <module name="realtime-gateway" options="-parameters" />
+      <module name="settlement-service" options="-parameters" />
+      <module name="state-processor" options="-parameters" />
+    </option>
+  </component>
+</project>

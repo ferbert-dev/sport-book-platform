@@ -30,7 +30,7 @@ class ProviderMessageValidatorTest {
     }
 
     @Test
-    void marketResultWithoutAWinnerIsRejected() {
+    final void marketResultWithoutAWinnerIsRejected() {
         ProviderMessage noWinner = new ProviderMessage(1, "MARKET_RESULT", "event-123",
                 "market-456", null, null, null, sentAt);
 
