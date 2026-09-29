@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 133 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 134 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -111,6 +111,9 @@ Client → bet-service → Redis (validate) → Postgres (bet + outbox) → Kafk
    handling in `MarketStateProjection` must go through it.
 4. **`ODDS_UPDATED` must not touch market status.** A price may move while a market is suspended;
    reopening must not resurrect a stale price.
+   **`SETTLED` is terminal** in `MarketStateProjection`: a newer `MARKET_SUSPENDED`/`MARKET_OPENED`
+   for a settled market is ignored (`MARKET_STATUS_AFTER_SETTLEMENT_IGNORED`). The feed worker cannot
+   know markets settled before it started, so this guard lives where the settled state lives.
 5. **Exactly two topics**: `sports-events` and `bet-events`. Do not add a third. `BET_REJECTED` is
    deliberately not published — rejections return synchronously over HTTP.
 6. **Partition keys**: `marketId` for market-scoped events, `eventId` for match-level, `betId` for
@@ -247,7 +250,8 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   still reopens it. `ActiveMarkets` is in memory and built from acknowledged publishes only; the
   worker never reads Redis to rebuild it. Because a restarted worker starts with an empty list,
   once any gap is seen a market it has not published yet is **quarantined**: suspended just before
-  its first price (`MARKET_QUARANTINED_AFTER_GAP`). Markets it saw settled are never suspended again.
+  its first price (`MARKET_QUARANTINED_AFTER_GAP`). It skips markets it saw settled; for ones settled
+  before it started, the projection's terminal `SETTLED` rule (invariant 4) ignores the suspension.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
   longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
   numbering ever restarted lower, a seeded validator would drop everything as duplicates.

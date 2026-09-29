@@ -125,6 +125,19 @@ class MarketStateProjectionTest {
     }
 
     @Test
+    void aSettledMarketIsNeverSuspendedOrReopenedEvenByANewerVersion() {
+        storedMarketVersion(1006L);
+        when(hash.get(RedisKeys.market(MARKET_ID), RedisKeys.FIELD_STATUS)).thenReturn(MarketStatus.SETTLED.name());
+
+        boolean suspended = projection.apply(new MarketSuspendedEvent(EVENT_ID, MARKET_ID, 1007, now));
+        boolean reopened = projection.apply(new MarketOpenedEvent(EVENT_ID, MARKET_ID, 1008, now));
+
+        assertThat(suspended).isFalse();
+        assertThat(reopened).isFalse();
+        verify(hash, never()).putAll(eq(RedisKeys.market(MARKET_ID)), any());
+    }
+
+    @Test
     void marketSettledMarksTheMarketTerminal() {
         storedMarketVersion(1005L);
 

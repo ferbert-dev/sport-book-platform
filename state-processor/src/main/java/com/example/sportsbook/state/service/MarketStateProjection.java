@@ -71,6 +71,15 @@ public class MarketStateProjection {
             logStale(event.type().name(), marketId, event.version());
             return false;
         }
+        // Settlement is terminal. A newer status event cannot reopen or suspend a settled market:
+        // bets on it are already paid out. The feed worker suspends markets it cannot vouch for
+        // after a gap, and after a restart it cannot know which markets were settled before it —
+        // so this rule belongs here, where the settled state actually lives.
+        if (status != MarketStatus.SETTLED && isSettled(marketId)) {
+            log.warn("MARKET_STATUS_AFTER_SETTLEMENT_IGNORED type={} eventId={} marketId={} version={}",
+                    event.type().name(), event.eventId(), marketId, event.version());
+            return false;
+        }
         registerMarket(event.eventId(), marketId);
         touchMarket(marketId, event.eventId(), status, event.version());
 
@@ -94,6 +103,11 @@ public class MarketStateProjection {
         log.info("{} eventId={} status={} version={}",
                 event.type().name(), event.eventId(), status, event.version());
         return true;
+    }
+
+    private boolean isSettled(String marketId) {
+        Object status = redis.opsForHash().get(RedisKeys.market(marketId), RedisKeys.FIELD_STATUS);
+        return MarketStatus.SETTLED.name().equals(String.valueOf(status));
     }
 
     private boolean marketVersionAdvances(String marketId, long incomingVersion) {
