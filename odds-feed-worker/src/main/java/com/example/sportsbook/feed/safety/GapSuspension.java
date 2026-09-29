@@ -1,10 +1,13 @@
 package com.example.sportsbook.feed.safety;
 
 import com.example.sportsbook.common.MarketSuspendedEvent;
+import com.example.sportsbook.common.OddsUpdatedEvent;
+import com.example.sportsbook.common.SportsEvent;
 
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * FIX 3: suspend-by-default on a sequence gap.
@@ -37,6 +40,26 @@ import java.util.Map;
 public final class GapSuspension {
 
     private GapSuspension() {
+    }
+
+    /**
+     * FIX 3, quarantine: suspending "every active market" only covers markets this process has
+     * published. After a restart that list starts empty, so a gap then suspends nothing, and a
+     * market whose MARKET_LOCK was lost would keep taking bets as its prices flow in. So once any
+     * gap has been seen, a market this process does not know yet is suspect: before its first price
+     * is published, it is suspended too.
+     *
+     * <p>Only prices trigger it. A first MARKET_UNLOCK or MARKET_SUSPENDED is the provider stating
+     * the status itself, and a MARKET_RESULT closes the market anyway. The version is
+     * {@code sequence - 1} for the same reason as {@link #suspendAll}: everything stored for this
+     * market predates the gap, and the price itself, at {@code sequence}, still outranks it.
+     */
+    public static Optional<MarketSuspendedEvent> quarantine(SportsEvent next, long sequence, boolean gapSeen,
+                                                            ActiveMarkets active, Instant now) {
+        if (gapSeen && next instanceof OddsUpdatedEvent price && !active.knows(price.marketId())) {
+            return Optional.of(new MarketSuspendedEvent(price.eventId(), price.marketId(), sequence - 1, now));
+        }
+        return Optional.empty();
     }
 
     public static List<MarketSuspendedEvent> suspendAll(Map<String, String> activeMarkets,

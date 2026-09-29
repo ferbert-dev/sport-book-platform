@@ -55,6 +55,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
     private final FeedMetrics metrics = new FeedMetrics();
     private final SequenceValidator sequenceValidator = new SequenceValidator();
     private final ActiveMarkets activeMarkets = new ActiveMarkets();
+    /** FIX 3: once any gap is seen, markets this process has not published yet are suspect. */
+    private boolean gapSeen;
 
     /** Resume point for a freshly started process, read from Kafka before the first connect. */
     private long lastPublishedAtStartup = -1;
@@ -151,7 +153,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
                 : Completable.complete();
         return suspensions
                 .andThen(Maybe.fromOptional(MessageNormalizer.normalize(message))
-                        .flatMapCompletable(event -> publish(event)
+                        .flatMapCompletable(event -> quarantineIfUnknown(event, sequence)
+                                .andThen(publish(event))
                                 .doOnComplete(() -> activeMarkets.track(event))))
                 // Only now, with Kafka's ack in hand, is the sequence delivered.
                 .doOnComplete(() -> sequenceValidator.markProcessed(sequence));
@@ -176,6 +179,18 @@ public class OddsFeedVerticle extends AbstractVerticle {
                     .concatMapCompletable(suspension -> publish(suspension)
                             .doOnComplete(() -> activeMarkets.track(suspension)));
         });
+    }
+
+    /** FIX 3: see {@link GapSuspension#quarantine}. */
+    private Completable quarantineIfUnknown(SportsEvent event, long sequence) {
+        return Completable.defer(() -> GapSuspension.quarantine(event, sequence, gapSeen, activeMarkets, Instant.now())
+                .map(suspension -> {
+                    log.warn("MARKET_QUARANTINED_AFTER_GAP eventId={} marketId={} version={}",
+                            suspension.eventId(), suspension.marketId(), suspension.version());
+                    metrics.oddsFeedGapSuspensionsTotal.incrementAndGet();
+                    return publish(suspension).doOnComplete(() -> activeMarkets.track(suspension));
+                })
+                .orElse(Completable.complete()));
     }
 
     private enum SequenceOutcome { SKIP, PROCESS, PROCESS_AFTER_GAP }
@@ -219,6 +234,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
     }
 
     private void reportGap(long expected, long received) {
+        gapSeen = true;
         metrics.oddsFeedSequenceGapsTotal.incrementAndGet();
         log.warn("SEQUENCE_GAP_DETECTED expectedSequence={} receivedSequence={} missed={}",
                 expected, received, received - expected);

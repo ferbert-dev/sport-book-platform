@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 129 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 133 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -245,7 +245,9 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   sweep. The synthetic `MARKET_SUSPENDED` is versioned `receivedSequence - 1` — above everything
   stored for the market, below the provider's next message — so the provider's own `MARKET_UNLOCK`
   still reopens it. `ActiveMarkets` is in memory and built from acknowledged publishes only; the
-  worker never reads Redis to rebuild it.
+  worker never reads Redis to rebuild it. Because a restarted worker starts with an empty list,
+  once any gap is seen a market it has not published yet is **quarantined**: suspended just before
+  its first price (`MARKET_QUARANTINED_AFTER_GAP`). Markets it saw settled are never suspended again.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
   longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
   numbering ever restarted lower, a seeded validator would drop everything as duplicates.

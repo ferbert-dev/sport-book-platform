@@ -65,6 +65,41 @@ class GapSuspensionTest {
     }
 
     @Test
+    void afterAGapAPriceForAMarketThisProcessHasNotSeenIsQuarantinedFirst() {
+        // Restarted worker: nothing known. A gap was seen; now a price arrives for market-456.
+        OddsUpdatedEvent price = new OddsUpdatedEvent("e1", "market-456", "home", new BigDecimal("1.40"), 106, NOW);
+
+        assertThat(GapSuspension.quarantine(price, 106, true, active, NOW))
+                .hasValueSatisfying(suspension -> {
+                    assertThat(suspension.marketId()).isEqualTo("market-456");
+                    assertThat(suspension.version()).isEqualTo(105);
+                });
+    }
+
+    @Test
+    void noQuarantineWithoutAGapOrForAMarketAlreadyKnown() {
+        OddsUpdatedEvent price = new OddsUpdatedEvent("e1", "m1", "home", new BigDecimal("1.40"), 106, NOW);
+        assertThat(GapSuspension.quarantine(price, 106, false, active, NOW)).isEmpty();
+
+        active.track(new MarketOpenedEvent("e1", "m1", 101, NOW));
+        assertThat(GapSuspension.quarantine(price, 106, true, active, NOW)).isEmpty();
+    }
+
+    @Test
+    void aMarketSeenSettledIsNeverQuarantinedBackToSuspended() {
+        active.track(new MarketSettledEvent("e1", "m1", "home", 103, NOW));
+        OddsUpdatedEvent latePrice = new OddsUpdatedEvent("e1", "m1", "home", new BigDecimal("1.40"), 106, NOW);
+
+        assertThat(GapSuspension.quarantine(latePrice, 106, true, active, NOW)).isEmpty();
+    }
+
+    @Test
+    void theProviderStatingTheStatusItselfIsNotQuarantined() {
+        assertThat(GapSuspension.quarantine(new MarketOpenedEvent("e1", "m9", 106, NOW), 106, true, active, NOW)).isEmpty();
+        assertThat(GapSuspension.quarantine(new MarketSuspendedEvent("e1", "m9", 106, NOW), 106, true, active, NOW)).isEmpty();
+    }
+
+    @Test
     void nothingActiveMeansNothingToSuspend() {
         assertThat(GapSuspension.suspendAll(active.snapshot(), 106, NOW)).isEmpty();
     }
