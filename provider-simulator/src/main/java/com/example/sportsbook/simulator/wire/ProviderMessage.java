@@ -14,6 +14,7 @@ import java.time.Instant;
  * stamps the real sequence when the message is emitted.
  */
 public record ProviderMessage(
+        long sessionEpoch,
         long sequenceNumber,
         String messageType,
         String matchId,
@@ -48,12 +49,12 @@ public record ProviderMessage(
         return draft("MARKET_RESULT", matchId, marketRef, null, null, winnerRef);
     }
 
-    public ProviderMessage stamped(long sequence, Instant at) {
-        return new ProviderMessage(sequence, messageType, matchId, marketRef, outcomeRef, price, winnerRef, at);
+    public ProviderMessage stamped(long epoch, long sequence, Instant at) {
+        return new ProviderMessage(epoch, sequence, messageType, matchId, marketRef, outcomeRef, price, winnerRef, at);
     }
 
     private static ProviderMessage draft(String type, String matchId, String marketRef, String outcomeRef,
                                          BigDecimal price, String winnerRef) {
-        return new ProviderMessage(0L, type, matchId, marketRef, outcomeRef, price, winnerRef, null);
+        return new ProviderMessage(0L, 0L, type, matchId, marketRef, outcomeRef, price, winnerRef, null);
     }
 }

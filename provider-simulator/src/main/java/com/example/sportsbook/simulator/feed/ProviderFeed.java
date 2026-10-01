@@ -33,6 +33,7 @@ public final class ProviderFeed {
     private final Deque<ProviderMessage> replay = new ArrayDeque<>();
 
     private long lastSequence;
+    private final long sessionEpoch;
     private long emitLimit = Long.MAX_VALUE;
     private ProviderMessage lastEmitted;
 
@@ -41,20 +42,21 @@ public final class ProviderFeed {
      *                      {@link SequenceReservation} so a restarted simulator keeps moving forward
      *                      instead of replaying numbers the version guard has already seen.
      */
-    public ProviderFeed(long startSequence, Clock clock) {
-        this(startSequence, clock, 10_000);
+    public ProviderFeed(long startSequence, Clock clock, long sessionEpoch) {
+        this(startSequence, clock, 10_000, sessionEpoch);
     }
 
-    public ProviderFeed(long startSequence, Clock clock, int replayCapacity) {
+    public ProviderFeed(long startSequence, Clock clock, int replayCapacity, long sessionEpoch) {
         this.lastSequence = startSequence;
         this.clock = clock;
         this.replayCapacity = replayCapacity;
+	    this.sessionEpoch = sessionEpoch;
     }
 
     /** Stamps the next sequence onto a draft and pushes it to connected subscribers. */
     public ProviderMessage emit(ProviderMessage draft) {
         ensureWithinLimit();
-        ProviderMessage message = draft.stamped(++lastSequence, clock.instant());
+        ProviderMessage message = draft.stamped(sessionEpoch, ++lastSequence, clock.instant());
         lastEmitted = message;
         replay.addLast(message);
         if (replay.size() > replayCapacity) {

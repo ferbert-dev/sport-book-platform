@@ -136,7 +136,7 @@ public class SimulatorVerticle extends AbstractVerticle {
     }
 
     private Completable startFeedAndServer(Clock clock) {
-        feed = new ProviderFeed(reservation.start(), clock);
+        feed = new ProviderFeed(reservation.start(), clock, 1L);
         feed.setEmitLimit(durableUpTo);
         // Propose the next block while half of the current one is still unused; flushReservation
         // makes it durable before the feed is allowed to use it.

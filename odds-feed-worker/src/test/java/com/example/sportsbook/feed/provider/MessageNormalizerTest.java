@@ -21,7 +21,7 @@ class MessageNormalizerTest {
 
     @Test
     void priceChangeBecomesOddsUpdatedAndCarriesSequenceAsVersion() {
-        ProviderMessage message = new ProviderMessage(1001, "PRICE_CHANGE", "event-123",
+        ProviderMessage message = new ProviderMessage(1, 1001, "PRICE_CHANGE", "event-123",
                 "market-456", "real-madrid", new BigDecimal("2.10"), null, sentAt);
 
         SportsEvent event = MessageNormalizer.normalize(message).orElseThrow();
@@ -46,7 +46,7 @@ class MessageNormalizerTest {
 
     @Test
     void marketResultBecomesMarketSettledWithTheWinningSelection() {
-        ProviderMessage message = new ProviderMessage(1006, "MARKET_RESULT", "event-123",
+        ProviderMessage message = new ProviderMessage(1, 1006, "MARKET_RESULT", "event-123",
                 "market-456", null, null, "real-madrid", sentAt);
 
         MarketSettledEvent settled = (MarketSettledEvent) MessageNormalizer.normalize(message).orElseThrow();
@@ -57,7 +57,7 @@ class MessageNormalizerTest {
 
     @Test
     void unknownProviderMessageTypeIsSkippedRatherThanThrowing() {
-        ProviderMessage message = new ProviderMessage(1, "SOME_FUTURE_TYPE", "event-123",
+        ProviderMessage message = new ProviderMessage(1, 1, "SOME_FUTURE_TYPE", "event-123",
                 "market-456", null, null, null, sentAt);
 
         Optional<SportsEvent> normalized = MessageNormalizer.normalize(message);
@@ -66,7 +66,7 @@ class MessageNormalizerTest {
     }
 
     private SportsEvent normalize(String providerType) {
-        return MessageNormalizer.normalize(new ProviderMessage(1, providerType, "event-123",
+        return MessageNormalizer.normalize(new ProviderMessage(1, 1, providerType, "event-123",
                 "market-456", null, null, "real-madrid", sentAt)).orElseThrow();
     }
 }

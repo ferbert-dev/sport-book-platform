@@ -11,7 +11,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ManualMatchDirectorTest {
 
-    private final ProviderFeed feed = new ProviderFeed(0L, Clock.systemUTC());
+    private final ProviderFeed feed = new ProviderFeed(0L, Clock.systemUTC(),1L);
     private final ManualMatchDirector director = new ManualMatchDirector(feed);
 
     @Test

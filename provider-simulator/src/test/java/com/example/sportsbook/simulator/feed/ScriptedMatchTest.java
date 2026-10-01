@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ScriptedMatchTest {
 
-    private final ProviderFeed feed = new ProviderFeed(100L, Clock.systemUTC());
+    private final ProviderFeed feed = new ProviderFeed(100L, Clock.systemUTC(),1L);
     private final ScriptedMatch scripted = new ScriptedMatch("event-123", "market-456");
 
     @Test

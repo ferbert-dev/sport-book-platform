@@ -1,5 +1,6 @@
 package com.example.sportsbook.simulator.feed;
 
+import com.example.sportsbook.simulator.wire.ProviderJson;
 import com.example.sportsbook.simulator.wire.ProviderMessage;
 import io.reactivex.rxjava3.subscribers.TestSubscriber;
 import org.junit.jupiter.api.Test;
@@ -14,7 +15,7 @@ class ProviderFeedTest {
 
     private static final Instant NOW = Instant.parse("2026-09-28T12:00:00Z");
 
-    private final ProviderFeed feed = new ProviderFeed(500L, Clock.fixed(NOW, ZoneOffset.UTC));
+    private final ProviderFeed feed = new ProviderFeed(500L, Clock.fixed(NOW, ZoneOffset.UTC),1L);
 
     @Test
     void emitStampsTheNextSequenceAndTheClockTime() {
@@ -61,6 +62,22 @@ class ProviderFeedTest {
     }
 
     @Test
+    void everyEmittedMessageCarriesTheFeedsSessionEpoch() {
+        ProviderFeed epochThree = new ProviderFeed(0L, Clock.fixed(NOW, ZoneOffset.UTC), 3L);
+
+        assertThat(epochThree.emit(ProviderMessage.matchStart("event-1")).sessionEpoch()).isEqualTo(3L);
+    }
+
+    @Test
+    void sessionEpochIsSentUnderTheKeyTheWorkerReads() {
+        // The provider/worker contract is the JSON, not a shared class: if the key here ever differs
+        // from the worker's ProviderMessage.sessionEpoch, the worker silently reads 0.
+        String json = ProviderJson.encode(feed.emit(ProviderMessage.matchStart("event-1")));
+
+        assertThat(json).contains("\"sessionEpoch\":");
+    }
+
+    @Test
     void failsClosedInsteadOfEmittingPastTheDurableReservation() {
         feed.setEmitLimit(502L);
         feed.emit(ProviderMessage.matchStart("event-1"));
@@ -89,7 +106,7 @@ class ProviderFeedTest {
 
     @Test
     void replayWindowIsBoundedAndReportsWhatItCanNoLongerReplay() {
-        ProviderFeed small = new ProviderFeed(0L, Clock.fixed(NOW, ZoneOffset.UTC), 2);
+        ProviderFeed small = new ProviderFeed(0L, Clock.fixed(NOW, ZoneOffset.UTC), 2, 1L);
         small.emit(ProviderMessage.matchStart("event-1"));
         small.emit(ProviderMessage.matchStart("event-2"));
         small.emit(ProviderMessage.matchStart("event-3"));
