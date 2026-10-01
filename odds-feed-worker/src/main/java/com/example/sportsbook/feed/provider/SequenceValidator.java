@@ -9,14 +9,20 @@ package com.example.sportsbook.feed.provider;
 public class SequenceValidator {
 
     private static final long NOT_STARTED = -1L;
-
     private long lastProcessedSequence = NOT_STARTED;
+    private long lastProcessedEpoch = NOT_STARTED;
+
 
     /** Decides and marks processed in one step. */
     public SequenceDecision evaluate(long incomingSequence) {
-        SequenceDecision decision = decide(incomingSequence);
-        if (decision != SequenceDecision.DUPLICATE) {
-            markProcessed(incomingSequence);
+        return evaluate(0L, incomingSequence);
+    }
+    /** Decides and marks processed in one step. */
+    public SequenceDecision evaluate(long epoch, long incomingSequence) {
+        SequenceDecision decision = decide(epoch, incomingSequence);
+
+        if (decision != SequenceDecision.DUPLICATE && decision != SequenceDecision.STALE_SESSION) {
+            markProcessed(epoch, incomingSequence);
         }
         return decision;
     }
@@ -35,6 +41,20 @@ public class SequenceValidator {
         }
         return incomingSequence > lastProcessedSequence + 1 ? SequenceDecision.GAP : SequenceDecision.IN_ORDER;
     }
+    public SequenceDecision decide(long incomingEpoch, long incomingSequence) {
+        if(lastProcessedEpoch == NOT_STARTED) {
+            return SequenceDecision.IN_ORDER;
+        }
+        if (incomingEpoch > lastProcessedEpoch) {
+            return SequenceDecision.NEW_SESSION;
+        }
+        else if (incomingEpoch < lastProcessedEpoch) {
+            return SequenceDecision.STALE_SESSION;
+        }
+        else {
+            return decide(incomingSequence);
+        }
+    }
 
     public void markProcessed(long sequence) {
         if (sequence > lastProcessedSequence) {
@@ -42,10 +62,22 @@ public class SequenceValidator {
         }
     }
 
+    public void markProcessed(long epoch, long sequence) {
+        if (epoch > lastProcessedEpoch) {
+            lastProcessedEpoch = epoch;
+            lastProcessedSequence = sequence;
+        }
+        else if (epoch == lastProcessedEpoch) {
+            markProcessed(sequence);
+        }
+    }
+
     public long lastProcessedSequence() {
         return lastProcessedSequence;
     }
-
+    public long lastProcessedEpoch() {
+        return lastProcessedEpoch;
+    }
     /** Called after a simulated snapshot/replay so the validator accepts the recovered stream. */
     public void resetTo(long sequence) {
         this.lastProcessedSequence = sequence;

@@ -230,6 +230,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
                 reportGap(sequenceValidator.lastProcessedSequence() + 1, sequence);
                 yield SequenceOutcome.PROCESS_AFTER_GAP;
             }
+            case NEW_SESSION, STALE_SESSION -> throw new IllegalStateException("session handling arrives in FIX 4 step 5");
         };
     }
 

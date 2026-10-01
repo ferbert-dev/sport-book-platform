@@ -64,7 +64,6 @@ class SequenceValidatorTest {
 
     @Test
     void decideDoesNotRecordSoAFailedPublishIsAcceptedAgainOnReplay() {
-        SequenceValidator validator = new SequenceValidator();
         validator.markProcessed(100);
 
         // 101 arrives, its publish fails: decided but never marked.
@@ -77,10 +76,85 @@ class SequenceValidatorTest {
 
     @Test
     void markProcessedNeverMovesTheCursorBackwards() {
-        SequenceValidator validator = new SequenceValidator();
         validator.markProcessed(200);
         validator.markProcessed(150);
 
         assertThat(validator.lastProcessedSequence()).isEqualTo(200);
+    }
+
+    // FIX 4: provider sessions (epoch)
+
+    @Test
+    void firstMessageOfAnyEpochIsInOrder() {
+        assertThat(validator.decide(3, 50)).isEqualTo(SequenceDecision.IN_ORDER);
+    }
+
+    @Test
+    void higherEpochIsANewSessionEvenWithALowerSequence() {
+        validator.markProcessed(1, 5000);
+
+        assertThat(validator.decide(2, 1)).isEqualTo(SequenceDecision.NEW_SESSION);
+    }
+
+    @Test
+    void lowerEpochIsAStaleSession() {
+        validator.markProcessed(2, 1);
+
+        assertThat(validator.decide(1, 10_000)).isEqualTo(SequenceDecision.STALE_SESSION);
+    }
+
+    @Test
+    void withinOneEpochDuplicatesAndGapsWorkAsBefore() {
+        validator.markProcessed(2, 1);
+
+        assertThat(validator.decide(2, 1)).isEqualTo(SequenceDecision.DUPLICATE);
+        assertThat(validator.decide(2, 2)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.decide(2, 5)).isEqualTo(SequenceDecision.GAP);
+    }
+
+    @Test
+    void markingANewEpochResetsTheSequence() {
+        validator.markProcessed(1, 5000);
+        validator.markProcessed(2, 1);
+
+        assertThat(validator.decide(2, 2)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.lastProcessedEpoch()).isEqualTo(2);
+    }
+
+    @Test
+    void markingAnOlderEpochIsIgnored() {
+        validator.markProcessed(2, 10);
+        validator.markProcessed(1, 1999);
+
+        assertThat(validator.lastProcessedEpoch()).isEqualTo(2);
+        assertThat(validator.lastProcessedSequence()).isEqualTo(10);
+    }
+
+    @Test
+    void evaluateRecordsTheEpoch() {
+        validator.evaluate(2, 10);
+
+        assertThat(validator.lastProcessedEpoch()).isEqualTo(2);
+    }
+
+    @Test
+    void staleMessageDoesNotMoveTheCursor() {
+        validator.evaluate(2, 10);
+
+        assertThat(validator.evaluate(1, 9999)).isEqualTo(SequenceDecision.STALE_SESSION);
+        // The point of the test: a late message of an old session must not poison the cursor,
+        // or real messages 11..9999 of session 2 would be dropped as duplicates.
+        assertThat(validator.lastProcessedSequence()).isEqualTo(10);
+    }
+
+    @Test
+    void decideNeverChangesState() {
+        validator.markProcessed(2, 10);
+
+        validator.decide(2, 100);
+        validator.decide(2, 100);
+
+        assertThat(validator.lastProcessedEpoch()).isEqualTo(2);
+        assertThat(validator.lastProcessedSequence()).isEqualTo(10);
     }
 }

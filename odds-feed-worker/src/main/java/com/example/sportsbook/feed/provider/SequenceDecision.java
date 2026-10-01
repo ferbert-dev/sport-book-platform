@@ -10,5 +10,9 @@ public enum SequenceDecision {
     DUPLICATE,
 
     /** Newer than expected: at least one message was missed. Process, but resynchronize. */
-    GAP
+    GAP,
+    /** Higher epoch: the provider restarted its numbering. Process it, and treat the switch like a gap. */
+    NEW_SESSION,
+    /** Lower epoch: a late message from a session already left behind. Drop it. */
+    STALE_SESSION
 }

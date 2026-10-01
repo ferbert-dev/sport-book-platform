@@ -823,7 +823,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-151 tests: 144 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+160 tests: 153 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |
