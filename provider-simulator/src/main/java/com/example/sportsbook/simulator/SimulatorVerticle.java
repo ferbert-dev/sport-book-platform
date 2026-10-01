@@ -28,10 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.OptionalLong;
+import java.util.*;
 import java.util.function.Consumer;
 
 /**
@@ -81,32 +78,32 @@ public class SimulatorVerticle extends AbstractVerticle {
                         clock.millis(), persisted, SequenceReservation.DEFAULT_BLOCK))
                 .flatMapCompletable(started -> {
                     reservation = started;
-                    return persistReservation(started.reservedUpTo())
+                    return persistReservation(started.epoch(), started.reservedUpTo())
                             .doOnComplete(() -> durableUpTo = started.reservedUpTo());
                 })
                 .andThen(Completable.defer(() -> startFeedAndServer(clock)));
     }
 
-    private Single<OptionalLong> readPersistedReservation() {
+    private Single<Optional<SequenceReservation.Persisted>> readPersistedReservation() {
         return vertx.fileSystem().rxExists(config.sequenceFile())
                 .flatMap(exists -> !exists
-                        ? Single.just(OptionalLong.empty())
+                        ? Single.just(Optional.<SequenceReservation.Persisted>empty())
                         : vertx.fileSystem().rxReadFile(config.sequenceFile())
-                                .map(content -> OptionalLong.of(Long.parseLong(content.toString().trim()))));
+                                .map(content -> Optional.of(SequenceReservation.parse(content.toString()))));
     }
 
     /**
      * Async write to a temp file, then an atomic rename: never blocks the event loop the feed runs
      * on, and a crash mid-write leaves the previous reservation intact instead of a torn file.
      */
-    private Completable persistReservation(long reservedUpTo) {
+    private Completable persistReservation(long epoch, long reservedUpTo) {
         String temp = config.sequenceFile() + ".tmp";
         return vertx.fileSystem()
-                .rxWriteFile(temp, Buffer.buffer(Long.toString(reservedUpTo)))
+                .rxWriteFile(temp, Buffer.buffer(SequenceReservation.format(epoch, reservedUpTo)))
                 .andThen(vertx.fileSystem().rxMove(temp, config.sequenceFile(),
                         new CopyOptions().setAtomicMove(true).setReplaceExisting(true)))
-                .doOnComplete(() -> log.info("SEQUENCE_RESERVED reservedUpTo={} file={}",
-                        reservedUpTo, config.sequenceFile()));
+                .doOnComplete(() -> log.info("SEQUENCE_RESERVED epoch={} reservedUpTo={} file={}",
+                        epoch, reservedUpTo, config.sequenceFile()));
     }
 
     /**
@@ -120,7 +117,7 @@ public class SimulatorVerticle extends AbstractVerticle {
         }
         long target = reservation.reservedUpTo();
         reservationWriteInFlight = true;
-        persistReservation(target).subscribe(
+        persistReservation(reservation.epoch(), target).subscribe(
                 () -> {
                     durableUpTo = target;
                     feed.setEmitLimit(target);
@@ -136,7 +133,7 @@ public class SimulatorVerticle extends AbstractVerticle {
     }
 
     private Completable startFeedAndServer(Clock clock) {
-        feed = new ProviderFeed(reservation.start(), clock, 1L);
+        feed = new ProviderFeed(reservation.start(), clock, reservation.epoch());
         feed.setEmitLimit(durableUpTo);
         // Propose the next block while half of the current one is still unused; flushReservation
         // makes it durable before the feed is allowed to use it.
