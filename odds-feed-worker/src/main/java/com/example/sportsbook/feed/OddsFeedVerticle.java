@@ -5,13 +5,7 @@ import com.example.sportsbook.common.SportsEvent;
 import com.example.sportsbook.feed.config.FeedConfig;
 import com.example.sportsbook.feed.messaging.LastPublishedSequence;
 import com.example.sportsbook.feed.messaging.SportsEventPublisher;
-import com.example.sportsbook.feed.provider.MessageNormalizer;
-import com.example.sportsbook.feed.provider.ProviderMessage;
-import com.example.sportsbook.feed.provider.ProviderMessageValidator;
-import com.example.sportsbook.feed.provider.ProviderStreamClient;
-import com.example.sportsbook.feed.provider.ReconnectBackoff;
-import com.example.sportsbook.feed.provider.SequenceDecision;
-import com.example.sportsbook.feed.provider.SequenceValidator;
+import com.example.sportsbook.feed.provider.*;
 import com.example.sportsbook.feed.safety.ActiveMarkets;
 import com.example.sportsbook.feed.safety.GapSuspension;
 import io.reactivex.rxjava3.core.Completable;
@@ -135,6 +129,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
     private Completable process(ProviderMessage message) {
         metrics.oddsFeedMessagesReceivedTotal.incrementAndGet();
         long sequence = message.sequenceNumber();
+        long sessionEpoch = message.sessionEpoch();
+        long version = ProviderVersion.compose(sessionEpoch, sequence);
         if (!validate(message)) {
             // Skipped, but NOT marked processed: the cursor tracks what Kafka acknowledged, and
             // moving it here would hide any gap in front of this message. The next valid message
@@ -149,15 +145,15 @@ public class OddsFeedVerticle extends AbstractVerticle {
         // revealed it. That message still goes out: dropping it would lose real state on top of
         // the gap, and if it is the provider's own MARKET_UNLOCK its higher version reopens.
         Completable suspensions = outcome == SequenceOutcome.PROCESS_AFTER_GAP
-                ? suspendActiveMarkets(sequence)
+                ? suspendActiveMarkets(version)
                 : Completable.complete();
         return suspensions
                 .andThen(Maybe.fromOptional(MessageNormalizer.normalize(message))
-                        .flatMapCompletable(event -> quarantineIfUnknown(event, sequence)
+                                .flatMapCompletable(event -> quarantineIfUnknown(event, version)
                                 .andThen(publish(event))
                                 .doOnComplete(() -> activeMarkets.track(event))))
                 // Only now, with Kafka's ack in hand, is the sequence delivered.
-                .doOnComplete(() -> sequenceValidator.markProcessed(sequence));
+                .doOnComplete(() -> sequenceValidator.markProcessed(sessionEpoch, sequence));
     }
 
     /**
@@ -165,15 +161,16 @@ public class OddsFeedVerticle extends AbstractVerticle {
      * the gap (see {@link GapSuspension} for why that version is both high and low enough). The
      * snapshot is taken at subscription, so a pipeline retry suspends whatever is active then.
      */
-    private Completable suspendActiveMarkets(long receivedSequence) {
+    private Completable suspendActiveMarkets(long receivedVersion
+    ) {
         return Completable.defer(() -> {
             List<MarketSuspendedEvent> suspensions =
-                    GapSuspension.suspendAll(activeMarkets.snapshot(), receivedSequence, Instant.now());
+                    GapSuspension.suspendAll(activeMarkets.snapshot(), receivedVersion, Instant.now());
             if (suspensions.isEmpty()) {
                 return Completable.complete();
             }
             log.warn("MARKETS_SUSPENDED_ON_GAP markets={} version={} receivedSequence={}",
-                    suspensions.size(), receivedSequence - 1, receivedSequence);
+                    suspensions.size(), receivedVersion - 1, receivedVersion);
             metrics.oddsFeedGapSuspensionsTotal.addAndGet(suspensions.size());
             return Flowable.fromIterable(suspensions)
                     .concatMapCompletable(suspension -> publish(suspension)
@@ -182,8 +179,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
     }
 
     /** FIX 3: see {@link GapSuspension#quarantine}. */
-    private Completable quarantineIfUnknown(SportsEvent event, long sequence) {
-        return Completable.defer(() -> GapSuspension.quarantine(event, sequence, gapSeen, activeMarkets, Instant.now())
+    private Completable quarantineIfUnknown(SportsEvent event, long version) {
+        return Completable.defer(() -> GapSuspension.quarantine(event, version, gapSeen, activeMarkets, Instant.now())
                 .map(suspension -> {
                     log.warn("MARKET_QUARANTINED_AFTER_GAP eventId={} marketId={} version={}",
                             suspension.eventId(), suspension.marketId(), suspension.version());
@@ -207,7 +204,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
 
     private SequenceOutcome checkSequence(ProviderMessage message) {
         long sequence = message.sequenceNumber();
-        SequenceDecision decision = sequenceValidator.decide(sequence);
+        long sessionEpoch = message.sessionEpoch();
+        SequenceDecision decision = sequenceValidator.decide(sessionEpoch, sequence);
 
         // First message of a restarted process: the validator is deliberately unseeded, so compare
         // with the cursor we asked the provider to resume from. A jump means the replay could not
@@ -230,7 +228,21 @@ public class OddsFeedVerticle extends AbstractVerticle {
                 reportGap(sequenceValidator.lastProcessedSequence() + 1, sequence);
                 yield SequenceOutcome.PROCESS_AFTER_GAP;
             }
-            case NEW_SESSION, STALE_SESSION -> throw new IllegalStateException("session handling arrives in FIX 4 step 5");
+            case NEW_SESSION -> {
+                // A session switch can hide the end of the old session, exactly like a gap: suspend
+                // every active market, and quarantine markets this process has not seen yet.
+                gapSeen = true;
+                metrics.oddsFeedSessionChangesTotal.incrementAndGet();
+                log.warn("PROVIDER_SESSION_CHANGED oldEpoch={} newEpoch={} firstSequence={}",
+                        sequenceValidator.lastProcessedEpoch(), sessionEpoch, sequence);
+                yield SequenceOutcome.PROCESS_AFTER_GAP;
+            }
+            case STALE_SESSION -> {
+                metrics.oddsFeedStaleSessionDropsTotal.incrementAndGet();
+                log.warn("PROVIDER_STALE_SESSION_DROPPED epoch={} currentEpoch={} sequence={}",
+                        sessionEpoch, sequenceValidator.lastProcessedEpoch(), sequence);
+                yield SequenceOutcome.SKIP;
+            }
         };
     }
 

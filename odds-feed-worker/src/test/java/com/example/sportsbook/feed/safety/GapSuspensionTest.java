@@ -5,6 +5,7 @@ import com.example.sportsbook.common.MarketSettledEvent;
 import com.example.sportsbook.common.MarketSuspendedEvent;
 import com.example.sportsbook.common.MatchStartedEvent;
 import com.example.sportsbook.common.OddsUpdatedEvent;
+import com.example.sportsbook.feed.provider.ProviderVersion;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
@@ -97,6 +98,28 @@ class GapSuspensionTest {
     void theProviderStatingTheStatusItselfIsNotQuarantined() {
         assertThat(GapSuspension.quarantine(new MarketOpenedEvent("e1", "m9", 106, NOW), 106, true, active, NOW)).isEmpty();
         assertThat(GapSuspension.quarantine(new MarketSuspendedEvent("e1", "m9", 106, NOW), 106, true, active, NOW)).isEmpty();
+    }
+
+    // FIX 4: event versions are composite, so the suspension arithmetic must hold on them too
+
+    @Test
+    void suspensionOutranksAMarketStoredAtACompositeVersion() {
+        long stored = ProviderVersion.compose(1, 42);
+        long received = ProviderVersion.compose(1, 45);
+
+        long suspension = GapSuspension.suspendAll(java.util.Map.of("m1", "e1"), received, NOW).get(0).version();
+
+        assertThat(suspension).isGreaterThan(stored).isLessThan(received);
+    }
+
+    @Test
+    void onANewSessionTheSuspensionOutranksEveryVersionOfTheOldSession() {
+        long lastOfOldSession = ProviderVersion.compose(2, 0) - 1; // = (epoch 1, highest sequence)
+        long firstOfNewSession = ProviderVersion.compose(2, 1);
+
+        long suspension = GapSuspension.suspendAll(java.util.Map.of("m1", "e1"), firstOfNewSession, NOW).get(0).version();
+
+        assertThat(suspension).isGreaterThan(lastOfOldSession).isLessThan(firstOfNewSession);
     }
 
     @Test

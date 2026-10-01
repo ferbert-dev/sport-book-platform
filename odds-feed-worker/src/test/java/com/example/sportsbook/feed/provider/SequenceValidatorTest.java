@@ -10,74 +10,74 @@ class SequenceValidatorTest {
 
     @Test
     void firstMessageEstablishesTheBaselineWhateverItsSequence() {
-        assertThat(validator.evaluate(100)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 100)).isEqualTo(SequenceDecision.IN_ORDER);
         assertThat(validator.lastProcessedSequence()).isEqualTo(100);
     }
 
     @Test
     void consecutiveSequencesAreInOrder() {
-        validator.evaluate(100);
+        validator.evaluate(0, 100);
 
-        assertThat(validator.evaluate(101)).isEqualTo(SequenceDecision.IN_ORDER);
-        assertThat(validator.evaluate(102)).isEqualTo(SequenceDecision.IN_ORDER);
-        assertThat(validator.evaluate(103)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 101)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 102)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 103)).isEqualTo(SequenceDecision.IN_ORDER);
     }
 
     @Test
     void replayedSequenceIsReportedAsDuplicate() {
-        validator.evaluate(100);
-        validator.evaluate(101);
+        validator.evaluate(0, 100);
+        validator.evaluate(0, 101);
 
-        assertThat(validator.evaluate(101)).isEqualTo(SequenceDecision.DUPLICATE);
-        assertThat(validator.evaluate(100)).isEqualTo(SequenceDecision.DUPLICATE);
+        assertThat(validator.evaluate(0, 101)).isEqualTo(SequenceDecision.DUPLICATE);
+        assertThat(validator.evaluate(0, 100)).isEqualTo(SequenceDecision.DUPLICATE);
     }
 
     @Test
     void duplicateDoesNotRewindTheBaseline() {
-        validator.evaluate(100);
-        validator.evaluate(105);
+        validator.evaluate(0, 100);
+        validator.evaluate(0, 105);
 
-        validator.evaluate(101);
+        validator.evaluate(0, 101);
 
         assertThat(validator.lastProcessedSequence()).isEqualTo(105);
     }
 
     @Test
     void missingSequenceIsReportedAsGapAndStillAdvancesTheBaseline() {
-        validator.evaluate(100);
-        validator.evaluate(101);
+        validator.evaluate(0, 100);
+        validator.evaluate(0, 101);
 
         // 102 never arrived.
-        assertThat(validator.evaluate(103)).isEqualTo(SequenceDecision.GAP);
+        assertThat(validator.evaluate(0, 103)).isEqualTo(SequenceDecision.GAP);
         assertThat(validator.lastProcessedSequence()).isEqualTo(103);
-        assertThat(validator.evaluate(104)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 104)).isEqualTo(SequenceDecision.IN_ORDER);
     }
 
     @Test
     void resetAfterSnapshotRecoveryRebaselinesTheStream() {
-        validator.evaluate(100);
+        validator.evaluate(0, 100);
 
-        validator.resetTo(500);
+        validator.resetTo(0, 500);
 
-        assertThat(validator.evaluate(501)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.evaluate(0, 501)).isEqualTo(SequenceDecision.IN_ORDER);
     }
 
     @Test
     void decideDoesNotRecordSoAFailedPublishIsAcceptedAgainOnReplay() {
-        validator.markProcessed(100);
+        validator.markProcessed(0, 100);
 
         // 101 arrives, its publish fails: decided but never marked.
-        assertThat(validator.decide(101)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.decide(0, 101)).isEqualTo(SequenceDecision.IN_ORDER);
 
         // Replayed after reconnect: still in order, not a duplicate.
-        assertThat(validator.decide(101)).isEqualTo(SequenceDecision.IN_ORDER);
+        assertThat(validator.decide(0, 101)).isEqualTo(SequenceDecision.IN_ORDER);
         assertThat(validator.lastProcessedSequence()).isEqualTo(100);
     }
 
     @Test
     void markProcessedNeverMovesTheCursorBackwards() {
-        validator.markProcessed(200);
-        validator.markProcessed(150);
+        validator.markProcessed(0, 200);
+        validator.markProcessed(0, 150);
 
         assertThat(validator.lastProcessedSequence()).isEqualTo(200);
     }
