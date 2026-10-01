@@ -20,7 +20,7 @@ class MessageNormalizerTest {
     private final Instant sentAt = Instant.parse("2026-09-26T10:00:00Z");
 
     @Test
-    void priceChangeBecomesOddsUpdatedAndCarriesSequenceAsVersion() {
+    void priceChangeBecomesOddsUpdatedVersionedByEpochAndSequence() {
         ProviderMessage message = new ProviderMessage(1, 1001, "PRICE_CHANGE", "event-123",
                 "market-456", "real-madrid", new BigDecimal("2.10"), null, sentAt);
 
@@ -32,7 +32,7 @@ class MessageNormalizerTest {
         assertThat(odds.marketId()).isEqualTo("market-456");
         assertThat(odds.selectionId()).isEqualTo("real-madrid");
         assertThat(odds.odds()).isEqualByComparingTo("2.10");
-        assertThat(odds.version()).isEqualTo(1001);
+        assertThat(odds.version()).isEqualTo(ProviderVersion.compose(1, 1001));
         assertThat(odds.timestamp()).isEqualTo(sentAt);
     }
 
@@ -52,7 +52,7 @@ class MessageNormalizerTest {
         MarketSettledEvent settled = (MarketSettledEvent) MessageNormalizer.normalize(message).orElseThrow();
 
         assertThat(settled.winningSelectionId()).isEqualTo("real-madrid");
-        assertThat(settled.version()).isEqualTo(1006);
+        assertThat(settled.version()).isEqualTo(ProviderVersion.compose(1, 1006));
     }
 
     @Test
@@ -65,8 +65,31 @@ class MessageNormalizerTest {
         assertThat(normalized).isEmpty();
     }
 
+    // FIX 4: the version is composed from the provider's session epoch and sequence
+
+    @Test
+    void versionCombinesEpochAndSequence() {
+        assertThat(normalizeAt(2, 5).version()).isEqualTo(ProviderVersion.compose(2, 5));
+    }
+
+    @Test
+    void newSessionEventsOutrankOldSessionEvents() {
+        assertThat(normalizeAt(2, 1).version()).isGreaterThan(normalizeAt(1, 999_999).version());
+    }
+
+    @Test
+    void epochZeroKeepsTheSequenceAsTheVersion() {
+        // A provider without sessions gets exactly the versions it got before FIX 4.
+        assertThat(normalizeAt(0, 1001).version()).isEqualTo(1001);
+    }
+
     private SportsEvent normalize(String providerType) {
         return MessageNormalizer.normalize(new ProviderMessage(1, 1, providerType, "event-123",
                 "market-456", null, null, "real-madrid", sentAt)).orElseThrow();
+    }
+
+    private SportsEvent normalizeAt(long epoch, long sequence) {
+        return MessageNormalizer.normalize(new ProviderMessage(epoch, sequence, "MATCH_START", "event-123",
+                null, null, null, null, sentAt)).orElseThrow();
     }
 }
