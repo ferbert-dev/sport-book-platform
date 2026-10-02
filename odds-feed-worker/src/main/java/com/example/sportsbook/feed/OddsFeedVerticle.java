@@ -139,13 +139,14 @@ public class OddsFeedVerticle extends AbstractVerticle {
         metrics.oddsFeedMessagesReceivedTotal.incrementAndGet();
         long sequence = message.sequenceNumber();
         long sessionEpoch = message.sessionEpoch();
-        long version = ProviderVersion.compose(sessionEpoch, sequence);
         if (!validate(message)) {
             // Skipped, but NOT marked processed: the cursor tracks what Kafka acknowledged, and
             // moving it here would hide any gap in front of this message. The next valid message
             // still goes through the gap check against the last acknowledged sequence.
             return Completable.complete();
         }
+        // Only after validation: an invalid position must be skipped, not thrown from here.
+        long version = ProviderVersion.compose(sessionEpoch, sequence);
         SequenceOutcome outcome = checkSequence(message);
         if (outcome == SequenceOutcome.SKIP) {
             return Completable.complete();

@@ -225,7 +225,8 @@ public class SimulatorVerticle extends AbstractVerticle {
      * bring the simulator back on the old epoch after workers had already seen the new one.
      *
      * <p>Refused with 409 while a reservation write is in flight: that write carries the old epoch
-     * and could land after ours, putting the old session back on disk. The caller retries.
+     * and could land after ours, putting the old session back on disk. The caller retries. While our
+     * write is in flight, block extensions wait; both outcomes flush whatever is pending afterwards.
      */
     private void restartSession(RoutingContext ctx) {
         if (reservationWriteInFlight) {
@@ -243,11 +244,17 @@ public class SimulatorVerticle extends AbstractVerticle {
                     feed.startNewSession(next.epoch());
                     feed.setEmitLimit(durableUpTo);
                     reservationWriteInFlight = false;
+                    flushReservation();
                     log.warn("PROVIDER_SESSION_RESTARTED oldEpoch={} newEpoch={} nextSequence=1", oldEpoch, next.epoch());
                     ok(ctx, new JsonObject().put("sessionEpoch", next.epoch()).put("nextSequence", 1));
                 },
                 error -> {
                     reservationWriteInFlight = false;
+                    // The old session may have proposed its next block while this write held the
+                    // slot (flushReservation returns early during it). Write it now, or a feed at the
+                    // end of its durable block stays stuck: an exhausted feed emits nothing that
+                    // would trigger another flush.
+                    flushReservation();
                     log.error("PROVIDER_SESSION_RESTART_FAILED oldEpoch={}", oldEpoch, error);
                     ctx.response().setStatusCode(500).putHeader("content-type", "application/json")
                             .end(new JsonObject().put("error", "SESSION_RESTART_FAILED").encode());

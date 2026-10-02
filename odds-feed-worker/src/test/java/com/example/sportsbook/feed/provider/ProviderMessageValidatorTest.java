@@ -54,4 +54,30 @@ class ProviderMessageValidatorTest {
         return new ProviderMessage(1, 1, "PRICE_CHANGE", "event-123", "market-456", selection,
                 price, null, sentAt);
     }
+
+    // FIX 4: a position that cannot become an event version is an invalid frame, not a crash
+
+    @Test
+    void negativeEpochIsInvalid() {
+        assertThat(ProviderMessageValidator.isValid(matchStartAt(-1, 1))).isFalse();
+    }
+
+    @Test
+    void sequenceAtOrAboveTheVersionRangeIsInvalid() {
+        assertThat(ProviderMessageValidator.isValid(matchStartAt(1, 1_000_000_000_000_000L))).isFalse();
+    }
+
+    @Test
+    void epochTooLargeForALongVersionIsInvalid() {
+        assertThat(ProviderMessageValidator.isValid(matchStartAt(10_000, 1))).isFalse();
+    }
+
+    @Test
+    void largestComposablePositionIsStillValid() {
+        assertThat(ProviderMessageValidator.isValid(matchStartAt(9_222, 999_999_999_999_999L))).isTrue();
+    }
+
+    private ProviderMessage matchStartAt(long epoch, long sequence) {
+        return new ProviderMessage(epoch, sequence, "MATCH_START", "event-123", null, null, null, null, sentAt);
+    }
 }
