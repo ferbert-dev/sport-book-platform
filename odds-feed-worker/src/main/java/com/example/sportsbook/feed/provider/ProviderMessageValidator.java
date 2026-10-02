@@ -12,7 +12,7 @@ public final class ProviderMessageValidator {
         if (message == null || message.messageType() == null || message.sentAt() == null) {
             return false;
         }
-        if (isBlank(message.matchId()) || message.sequenceNumber() < 0) {
+        if (isBlank(message.matchId()) || !isComposablePosition(message)) {
             return false;
         }
         return switch (message.messageType()) {
@@ -26,6 +26,21 @@ public final class ProviderMessageValidator {
             case "MATCH_START", "MATCH_END" -> true;
             default -> false;
         };
+    }
+
+    /**
+     * FIX 4: the (epoch, sequence) pair must make a valid event version. A negative epoch, a
+     * sequence at or above 10^15, or an epoch too large for a {@code long} version would otherwise
+     * throw later in the pipeline — and a throw there restarts the pipeline, the provider replays the
+     * same frame, and ingestion loops on it forever. Rejected here, it is skipped like any bad frame.
+     */
+    private static boolean isComposablePosition(ProviderMessage message) {
+        try {
+            ProviderVersion.compose(message.sessionEpoch(), message.sequenceNumber());
+            return true;
+        } catch (IllegalArgumentException | ArithmeticException invalidPosition) {
+            return false;
+        }
     }
 
     private static boolean isBlank(String value) {

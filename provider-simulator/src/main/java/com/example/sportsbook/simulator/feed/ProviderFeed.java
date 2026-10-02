@@ -14,8 +14,9 @@ import java.util.List;
  * here and gets the next sequence number, so a connected worker sees ONE contiguous sequence,
  * which is how real provider feeds number a connection.
  *
- * <p>One global sequence is also monotonic per market and per match, which is all the downstream
- * version guard needs, since the worker uses the sequence as the domain version.
+ * <p>Every message also carries the session epoch (FIX 4). {@link #startNewSession} is a provider
+ * restart: the epoch goes up and numbering starts again at 1, so the (epoch, sequence) pair — which
+ * the worker turns into the event version — keeps growing while the bare sequence does not.
  *
  * <p><b>Hot stream with a replay window:</b> the last {@code replayCapacity} messages are kept, so
  * a worker that reconnects with a cursor ({@link #replayFrom}) gets what it missed before live
@@ -33,6 +34,7 @@ public final class ProviderFeed {
     private final Deque<ProviderMessage> replay = new ArrayDeque<>();
 
     private long lastSequence;
+    private long sessionEpoch;
     private long emitLimit = Long.MAX_VALUE;
     private ProviderMessage lastEmitted;
 
@@ -41,20 +43,40 @@ public final class ProviderFeed {
      *                      {@link SequenceReservation} so a restarted simulator keeps moving forward
      *                      instead of replaying numbers the version guard has already seen.
      */
-    public ProviderFeed(long startSequence, Clock clock) {
-        this(startSequence, clock, 10_000);
+    public ProviderFeed(long startSequence, Clock clock, long sessionEpoch) {
+        this(startSequence, clock, 10_000, sessionEpoch);
     }
 
-    public ProviderFeed(long startSequence, Clock clock, int replayCapacity) {
+    public ProviderFeed(long startSequence, Clock clock, int replayCapacity, long sessionEpoch) {
         this.lastSequence = startSequence;
         this.clock = clock;
         this.replayCapacity = replayCapacity;
+        this.sessionEpoch = sessionEpoch;
     }
 
-    /** Stamps the next sequence onto a draft and pushes it to connected subscribers. */
+    /**
+     * A provider restart: the next message is {@code (newEpoch, 1)}. Connected workers stay
+     * subscribed and simply see the new epoch. The replay window is kept, so a worker that missed the
+     * end of the old session still gets it before the new one.
+     *
+     * <p>The caller must raise {@link #setEmitLimit} for the new session: the old limit was a
+     * sequence of the old numbering.
+     *
+     * @throws IllegalArgumentException unless {@code newEpoch} is higher than the current epoch;
+     *                                  a session that went back would be dropped as stale
+     */
+    public void startNewSession(long newEpoch) {
+        if (newEpoch <= sessionEpoch) {
+            throw new IllegalArgumentException("new session epoch must be above " + sessionEpoch + ", got " + newEpoch);
+        }
+        sessionEpoch = newEpoch;
+        lastSequence = 0;
+    }
+
+    /** Stamps the epoch and the next sequence onto a draft and pushes it to connected subscribers. */
     public ProviderMessage emit(ProviderMessage draft) {
         ensureWithinLimit();
-        ProviderMessage message = draft.stamped(++lastSequence, clock.instant());
+        ProviderMessage message = draft.stamped(sessionEpoch, ++lastSequence, clock.instant());
         lastEmitted = message;
         replay.addLast(message);
         if (replay.size() > replayCapacity) {
@@ -65,18 +87,29 @@ public final class ProviderFeed {
     }
 
     /**
-     * Messages with {@code sequenceNumber >= fromSequence}, oldest first. Injected duplicates are
-     * not replayed: the window holds each sequence once.
+     * Messages at or after {@code (fromEpoch, fromSequence)}, oldest first: the rest of that session
+     * and every later one. Positions compare by epoch first, then by sequence within the epoch.
+     * Injected duplicates are not replayed: the window holds each position once.
      *
      * <p>Replay then subscribe must happen in the same event-loop turn (the stream handler does
      * both inside one call), so no live message can slip in between the two.
      */
-    public Replay replayFrom(long fromSequence) {
+    public Replay replayFrom(long fromEpoch, long fromSequence) {
         List<ProviderMessage> missed = replay.stream()
-                .filter(message -> message.sequenceNumber() >= fromSequence)
+                .filter(message -> compare(message.sessionEpoch(), message.sequenceNumber(), fromEpoch, fromSequence) >= 0)
                 .toList();
-        long oldestKept = replay.isEmpty() ? lastSequence + 1 : replay.peekFirst().sequenceNumber();
-        return new Replay(missed, fromSequence >= oldestKept);
+        // Complete when nothing the worker asked for has left the window: the oldest message kept
+        // (or, with an empty window, the next one to be emitted) is not after the requested position.
+        boolean complete = replay.isEmpty()
+                ? compare(sessionEpoch, lastSequence + 1, fromEpoch, fromSequence) <= 0
+                : compare(replay.peekFirst().sessionEpoch(), replay.peekFirst().sequenceNumber(),
+                        fromEpoch, fromSequence) <= 0;
+        return new Replay(missed, complete);
+    }
+
+    /** Orders two stream positions: epoch first, then sequence. The simulator's own rule, no worker types. */
+    private static int compare(long epoch, long sequence, long otherEpoch, long otherSequence) {
+        return epoch != otherEpoch ? Long.compare(epoch, otherEpoch) : Long.compare(sequence, otherSequence);
     }
 
     /**
@@ -116,6 +149,10 @@ public final class ProviderFeed {
 
     public long lastSequence() {
         return lastSequence;
+    }
+
+    public long sessionEpoch() {
+        return sessionEpoch;
     }
 
     /**

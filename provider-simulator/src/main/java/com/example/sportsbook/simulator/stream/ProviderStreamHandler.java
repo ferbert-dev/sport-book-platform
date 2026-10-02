@@ -15,8 +15,10 @@ import org.slf4j.LoggerFactory;
  * <p>Wire format: one {@code ProviderMessage} per text frame, encoded with
  * {@link ProviderJson#encode}.
  *
- * <p><b>Resume:</b> a worker reconnecting with {@code ?fromSequence=N} first gets every buffered
- * message from {@code N} on, then the live stream. Without the parameter it gets live traffic only.
+ * <p><b>Resume:</b> a worker reconnecting with {@code ?sessionEpoch=E&fromSequence=N} first gets
+ * every buffered message from position {@code (E, N)} on — the rest of session E and every later
+ * session — then the live stream. Without {@code sessionEpoch} the current session is assumed;
+ * without {@code fromSequence} it gets live traffic only.
  */
 public class ProviderStreamHandler {
 
@@ -40,8 +42,12 @@ public class ProviderStreamHandler {
         }
 
         String remote = String.valueOf(socket.remoteAddress());
-        Long fromSequence = fromSequence(socket.query());
-        log.info("PROVIDER_STREAM_CONNECTED remote={} fromSequence={}", remote, fromSequence);
+        Long fromSequence = longParam(socket.query(), "fromSequence");
+        // A worker that sends no epoch (or a client like websocat) resumes within the current session.
+        Long requestedEpoch = longParam(socket.query(), "sessionEpoch");
+        long fromEpoch = requestedEpoch != null ? requestedEpoch : feed.sessionEpoch();
+        log.info("PROVIDER_STREAM_CONNECTED remote={} sessionEpoch={} fromSequence={} currentEpoch={}",
+                remote, requestedEpoch, fromSequence, feed.sessionEpoch());
 
         // Complete the handshake now, so the replay can be written from inside this handler.
         socket.accept();
@@ -49,14 +55,14 @@ public class ProviderStreamHandler {
         // Replay and live subscription happen in this one event-loop turn: nothing can be
         // emitted in between, so the worker sees missed messages then live ones, no hole, no overlap.
         if (fromSequence != null) {
-            ProviderFeed.Replay replay = feed.replayFrom(fromSequence);
+            ProviderFeed.Replay replay = feed.replayFrom(fromEpoch, fromSequence);
             replay.messages().forEach(message -> write(socket, message, remote));
             if (replay.complete()) {
-                log.info("PROVIDER_STREAM_REPLAYED remote={} fromSequence={} messages={}",
-                        remote, fromSequence, replay.messages().size());
+                log.info("PROVIDER_STREAM_REPLAYED remote={} fromEpoch={} fromSequence={} messages={}",
+                        remote, fromEpoch, fromSequence, replay.messages().size());
             } else {
-                log.warn("PROVIDER_STREAM_REPLAY_INCOMPLETE remote={} fromSequence={} messages={} "
-                        + "note=range-left-replay-window", remote, fromSequence, replay.messages().size());
+                log.warn("PROVIDER_STREAM_REPLAY_INCOMPLETE remote={} fromEpoch={} fromSequence={} messages={} "
+                        + "note=range-left-replay-window", remote, fromEpoch, fromSequence, replay.messages().size());
             }
         }
 
@@ -100,12 +106,12 @@ public class ProviderStreamHandler {
                         error -> log.debug("PROVIDER_STREAM_WRITE_FAILED remote={}", remote, error));
     }
 
-    /** {@code null} when absent or not a number: the worker then simply gets live traffic. */
-    private static Long fromSequence(String query) {
+    /** {@code null} when the query parameter is absent or not a number. */
+    private static Long longParam(String query, String name) {
         if (query == null) {
             return null;
         }
-        var values = new QueryStringDecoder("?" + query).parameters().get("fromSequence");
+        var values = new QueryStringDecoder("?" + query).parameters().get(name);
         try {
             return values == null || values.isEmpty() ? null : Long.parseLong(values.get(0));
         } catch (NumberFormatException malformed) {

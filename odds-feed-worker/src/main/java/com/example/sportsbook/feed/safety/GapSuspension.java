@@ -18,13 +18,17 @@ import java.util.Optional;
  * So every active market is suspended, and reopens only when the provider itself sends
  * {@code MARKET_UNLOCK} again.
  *
- * <h2>Why version = receivedSequence - 1</h2>
+ * <p>Versions here are event versions, {@code ProviderVersion.compose(epoch, sequence)} (FIX 4),
+ * never bare sequences: the projection stores composite versions, so a suspension built from a
+ * bare sequence would be dropped by its version guard.
+ *
+ * <h2>Why version = receivedVersion - 1</h2>
  *
  * <p>The synthetic suspension must pass the projection's version guard, and must not outrank what
  * the provider sends next:
  *
  * <pre>
- *   every market's stored version  &lt;  expected  &lt;=  received - 1  &lt;  received  &lt;=  later provider messages
+ *   every market's stored version  &lt;  expected  &lt;=  receivedVersion - 1  &lt;  receivedVersion  &lt;=  later messages
  * </pre>
  *
  * <ul>
@@ -34,8 +38,10 @@ import java.util.Optional;
  *       {@code MARKET_UNLOCK} from the provider still wins and reopens the market.</li>
  * </ul>
  *
- * <p>{@code received - 1} is a sequence inside the lost range, so no real message will ever claim
- * it: the cursor has already moved past it. Versions are per market key, so every market can share it.
+ * <p>{@code compose(e, s) - 1 == compose(e, s - 1)}: a position inside the lost range, which no real
+ * message will claim since the cursor has moved past it. For a new session,
+ * {@code compose(e, 1) - 1 == compose(e, 0)} still outranks every version of epoch {@code e - 1}.
+ * Versions are per market key, so every market can share it.
  */
 public final class GapSuspension {
 
@@ -51,20 +57,20 @@ public final class GapSuspension {
      *
      * <p>Only prices trigger it. A first MARKET_UNLOCK or MARKET_SUSPENDED is the provider stating
      * the status itself, and a MARKET_RESULT closes the market anyway. The version is
-     * {@code sequence - 1} for the same reason as {@link #suspendAll}: everything stored for this
-     * market predates the gap, and the price itself, at {@code sequence}, still outranks it.
+     * {@code version - 1} for the same reason as {@link #suspendAll}: everything stored for this
+     * market predates the gap, and the price itself, at {@code version}, still outranks it.
      */
-    public static Optional<MarketSuspendedEvent> quarantine(SportsEvent next, long sequence, boolean gapSeen,
+    public static Optional<MarketSuspendedEvent> quarantine(SportsEvent next, long version, boolean gapSeen,
                                                             ActiveMarkets active, Instant now) {
         if (gapSeen && next instanceof OddsUpdatedEvent price && !active.knows(price.marketId())) {
-            return Optional.of(new MarketSuspendedEvent(price.eventId(), price.marketId(), sequence - 1, now));
+            return Optional.of(new MarketSuspendedEvent(price.eventId(), price.marketId(), version - 1, now));
         }
         return Optional.empty();
     }
 
     public static List<MarketSuspendedEvent> suspendAll(Map<String, String> activeMarkets,
-                                                        long receivedSequence, Instant now) {
-        long version = receivedSequence - 1;
+                                                        long receivedVersion, Instant now) {
+        long version = receivedVersion - 1;
         return activeMarkets.entrySet().stream()
                 .map(market -> new MarketSuspendedEvent(market.getValue(), market.getKey(), version, now))
                 .toList();

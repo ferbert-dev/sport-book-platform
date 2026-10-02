@@ -28,10 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.OptionalLong;
+import java.util.*;
 import java.util.function.Consumer;
 
 /**
@@ -81,32 +78,32 @@ public class SimulatorVerticle extends AbstractVerticle {
                         clock.millis(), persisted, SequenceReservation.DEFAULT_BLOCK))
                 .flatMapCompletable(started -> {
                     reservation = started;
-                    return persistReservation(started.reservedUpTo())
+                    return persistReservation(started.epoch(), started.reservedUpTo())
                             .doOnComplete(() -> durableUpTo = started.reservedUpTo());
                 })
                 .andThen(Completable.defer(() -> startFeedAndServer(clock)));
     }
 
-    private Single<OptionalLong> readPersistedReservation() {
+    private Single<Optional<SequenceReservation.Persisted>> readPersistedReservation() {
         return vertx.fileSystem().rxExists(config.sequenceFile())
                 .flatMap(exists -> !exists
-                        ? Single.just(OptionalLong.empty())
+                        ? Single.just(Optional.<SequenceReservation.Persisted>empty())
                         : vertx.fileSystem().rxReadFile(config.sequenceFile())
-                                .map(content -> OptionalLong.of(Long.parseLong(content.toString().trim()))));
+                                .map(content -> Optional.of(SequenceReservation.parse(content.toString()))));
     }
 
     /**
      * Async write to a temp file, then an atomic rename: never blocks the event loop the feed runs
      * on, and a crash mid-write leaves the previous reservation intact instead of a torn file.
      */
-    private Completable persistReservation(long reservedUpTo) {
+    private Completable persistReservation(long epoch, long reservedUpTo) {
         String temp = config.sequenceFile() + ".tmp";
         return vertx.fileSystem()
-                .rxWriteFile(temp, Buffer.buffer(Long.toString(reservedUpTo)))
+                .rxWriteFile(temp, Buffer.buffer(SequenceReservation.format(epoch, reservedUpTo)))
                 .andThen(vertx.fileSystem().rxMove(temp, config.sequenceFile(),
                         new CopyOptions().setAtomicMove(true).setReplaceExisting(true)))
-                .doOnComplete(() -> log.info("SEQUENCE_RESERVED reservedUpTo={} file={}",
-                        reservedUpTo, config.sequenceFile()));
+                .doOnComplete(() -> log.info("SEQUENCE_RESERVED epoch={} reservedUpTo={} file={}",
+                        epoch, reservedUpTo, config.sequenceFile()));
     }
 
     /**
@@ -120,7 +117,7 @@ public class SimulatorVerticle extends AbstractVerticle {
         }
         long target = reservation.reservedUpTo();
         reservationWriteInFlight = true;
-        persistReservation(target).subscribe(
+        persistReservation(reservation.epoch(), target).subscribe(
                 () -> {
                     durableUpTo = target;
                     feed.setEmitLimit(target);
@@ -136,7 +133,7 @@ public class SimulatorVerticle extends AbstractVerticle {
     }
 
     private Completable startFeedAndServer(Clock clock) {
-        feed = new ProviderFeed(reservation.start(), clock);
+        feed = new ProviderFeed(reservation.start(), clock, reservation.epoch());
         feed.setEmitLimit(durableUpTo);
         // Propose the next block while half of the current one is still unused; flushReservation
         // makes it durable before the feed is allowed to use it.
@@ -163,8 +160,8 @@ public class SimulatorVerticle extends AbstractVerticle {
                 .rxListen(config.port())
                 .doOnSuccess(started -> {
                     server = started;
-                    log.info("PROVIDER_SIMULATOR_LISTENING port={} streamPath={} firstSequence={}",
-                            config.port(), config.streamPath(), feed.lastSequence() + 1);
+                    log.info("PROVIDER_SIMULATOR_LISTENING port={} streamPath={} sessionEpoch={} firstSequence={}",
+                            config.port(), config.streamPath(), feed.sessionEpoch(), feed.lastSequence() + 1);
                 })
                 .ignoreElement();
     }
@@ -222,6 +219,48 @@ public class SimulatorVerticle extends AbstractVerticle {
         ok(ctx, new JsonObject().put("eventId", eventId).put("stopped", stopped));
     }
 
+    /**
+     * FIX 4: starts a new provider session. The new session is made durable FIRST and the feed is
+     * switched only once that write has landed; switching first and crashing before the write would
+     * bring the simulator back on the old epoch after workers had already seen the new one.
+     *
+     * <p>Refused with 409 while a reservation write is in flight: that write carries the old epoch
+     * and could land after ours, putting the old session back on disk. The caller retries. While our
+     * write is in flight, block extensions wait; both outcomes flush whatever is pending afterwards.
+     */
+    private void restartSession(RoutingContext ctx) {
+        if (reservationWriteInFlight) {
+            ctx.response().setStatusCode(409).putHeader("content-type", "application/json")
+                    .end(new JsonObject().put("error", "RESERVATION_WRITE_IN_PROGRESS").encode());
+            return;
+        }
+        long oldEpoch = reservation.epoch();
+        SequenceReservation next = reservation.nextSession(SequenceReservation.DEFAULT_BLOCK);
+        reservationWriteInFlight = true;
+        persistReservation(next.epoch(), next.reservedUpTo()).subscribe(
+                () -> {
+                    reservation = next;
+                    durableUpTo = next.reservedUpTo();
+                    feed.startNewSession(next.epoch());
+                    feed.setEmitLimit(durableUpTo);
+                    reservationWriteInFlight = false;
+                    flushReservation();
+                    log.warn("PROVIDER_SESSION_RESTARTED oldEpoch={} newEpoch={} nextSequence=1", oldEpoch, next.epoch());
+                    ok(ctx, new JsonObject().put("sessionEpoch", next.epoch()).put("nextSequence", 1));
+                },
+                error -> {
+                    reservationWriteInFlight = false;
+                    // The old session may have proposed its next block while this write held the
+                    // slot (flushReservation returns early during it). Write it now, or a feed at the
+                    // end of its durable block stays stuck: an exhausted feed emits nothing that
+                    // would trigger another flush.
+                    flushReservation();
+                    log.error("PROVIDER_SESSION_RESTART_FAILED oldEpoch={}", oldEpoch, error);
+                    ctx.response().setStatusCode(500).putHeader("content-type", "application/json")
+                            .end(new JsonObject().put("error", "SESSION_RESTART_FAILED").encode());
+                });
+    }
+
     private JsonObject scriptedStatus() {
         return new JsonObject()
                 .put("eventId", config.scriptedEventId())
@@ -236,8 +275,12 @@ public class SimulatorVerticle extends AbstractVerticle {
 
         router.get("/dev/health").handler(ctx -> ok(ctx, new JsonObject()
                 .put("status", "UP")
+                .put("sessionEpoch", feed.sessionEpoch())
                 .put("lastSequence", feed.lastSequence())
                 .put("scripted", scriptedStatus())));
+
+        // FIX 4: act like a provider that restarted — new session epoch, numbering from 1 again.
+        router.post("/dev/session/restart").handler(this::restartSession);
 
         // Stop all generated traffic for one event, scripted or dev match.
         router.post("/dev/events/:eventId/stop").handler(this::stopEventTraffic);

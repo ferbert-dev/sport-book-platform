@@ -32,9 +32,10 @@ import java.util.function.LongSupplier;
  * instead of frames piling up in memory. The provider decides what to do with a worker that falls
  * behind (the simulator disconnects it).
  *
- * <p><b>Resume:</b> every (re)connect asks for {@code ?fromSequence=<last delivered + 1>}, so the
- * provider replays what we missed while disconnected before live traffic resumes. With nothing
- * delivered yet it asks for {@code fromSequence=0}: everything the provider still holds. Whatever the
+ * <p><b>Resume:</b> every (re)connect asks for
+ * {@code ?sessionEpoch=<last epoch>&fromSequence=<last delivered + 1>}, so the provider replays what
+ * we missed while disconnected — the rest of that session and any later one — before live traffic
+ * resumes. With nothing delivered yet it asks from {@code (0, 0)}: everything the provider holds. Whatever the
  * provider can no longer replay still shows up in the worker's {@link SequenceValidator} as a gap,
  * which is why the validator must NOT be reset per connection.
  *
@@ -52,24 +53,27 @@ public class ProviderStreamClient {
     private final ReconnectBackoff backoff;
     private final Scheduler scheduler;
     private final AtomicLong unparseableFrames;
+    private final LongSupplier lastProcessedEpoch;
     private final LongSupplier lastProcessedSequence;
 
     /**
      * @param connectTimeout bounds each connect attempt. Without it, dialing a provider whose host
      *                       has vanished waits out TCP's default (~60s in Vert.x) before the
      *                       backoff even starts.
-     * @param lastProcessedSequence read on every connect to build the resume cursor; negative
-     *                              means nothing delivered yet, so replay from the start
+     * @param lastProcessedEpoch    read on every connect, with the sequence, to build the resume
+     *                              position
+     * @param lastProcessedSequence negative means nothing delivered yet, so replay from the start
      */
     public ProviderStreamClient(Vertx vertx, String providerUrl, Duration connectTimeout,
                                 ReconnectBackoff backoff, AtomicLong unparseableFrames,
-                                LongSupplier lastProcessedSequence) {
+                                LongSupplier lastProcessedEpoch, LongSupplier lastProcessedSequence) {
         this.client = vertx.createWebSocketClient(
                 new WebSocketClientOptions().setConnectTimeout((int) connectTimeout.toMillis()));
         this.providerUrl = providerUrl;
         this.backoff = backoff;
         this.scheduler = RxHelper.scheduler(vertx);
         this.unparseableFrames = unparseableFrames;
+        this.lastProcessedEpoch = lastProcessedEpoch;
         this.lastProcessedSequence = lastProcessedSequence;
     }
 
@@ -90,7 +94,7 @@ public class ProviderStreamClient {
      * {@code retryWhen} only reacts to errors.
      */
     private Flowable<ProviderMessage> connectOnce() {
-        String url = resumeUrl(providerUrl, lastProcessedSequence.getAsLong());
+        String url = resumeUrl(providerUrl, lastProcessedEpoch.getAsLong(), lastProcessedSequence.getAsLong());
         return client.rxConnect(new WebSocketConnectOptions().setAbsoluteURI(url))
                 .doOnSuccess(socket -> {
                     backoff.reset();
@@ -108,12 +112,18 @@ public class ProviderStreamClient {
     }
 
     /**
-     * Always carries a cursor. Asking for live-only would silently drop whatever the provider sent
+     * Always carries a position. Asking for live-only would silently drop whatever the provider sent
      * before this worker first connected, a settlement included.
+     *
+     * <p>The position is the pair (session epoch, sequence), FIX 4: with nothing delivered yet it is
+     * {@code (0, 0)}, which is before everything the provider holds.
      */
-    static String resumeUrl(String providerUrl, long lastDelivered) {
-        long from = lastDelivered < 0 ? 0 : lastDelivered + 1;
-        return providerUrl + (providerUrl.contains("?") ? "&" : "?") + "fromSequence=" + from;
+    static String resumeUrl(String providerUrl, long lastEpoch, long lastSequence) {
+        boolean nothingDelivered = lastEpoch < 0 || lastSequence < 0;
+        long epoch = nothingDelivered ? 0 : lastEpoch;
+        long from = nothingDelivered ? 0 : lastSequence + 1;
+        return providerUrl + (providerUrl.contains("?") ? "&" : "?")
+                + "sessionEpoch=" + epoch + "&fromSequence=" + from;
     }
 
     /** A malformed frame is logged and skipped; it must not tear down the connection. */
