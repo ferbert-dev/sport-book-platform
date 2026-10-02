@@ -52,8 +52,6 @@ public class OddsFeedVerticle extends AbstractVerticle {
     /** FIX 3: once any gap is seen, markets this process has not published yet are suspect. */
     private boolean gapSeen;
 
-    /** Resume point for a freshly started process, read from Kafka before the first connect. */
-    private long lastPublishedAtStartup = -1;
     private SportsEventPublisher publisher;
     private ProviderStreamClient providerClient;
     private Disposable pipeline;
@@ -76,22 +74,31 @@ public class OddsFeedVerticle extends AbstractVerticle {
                             failure.getMessage(), STARTUP_RETRY_MS);
                     return Flowable.timer(STARTUP_RETRY_MS, TimeUnit.MILLISECONDS, RxHelper.scheduler(vertx));
                 }))
-                .doOnSuccess(sequence -> {
-                    lastPublishedAtStartup = sequence;
-                    log.info("RESUME_CURSOR_FROM_KAFKA lastPublishedSequence={}", sequence);
-                })
+                .doOnSuccess(this::resumeFrom)
                 .ignoreElement()
                 .andThen(Completable.fromAction(this::startPipeline));
     }
 
     /**
-     * Cursor for the provider: the last sequence Kafka acknowledged — from this process, or before
-     * that, from an earlier one. The validator itself is NOT seeded from Kafka: if the provider's
-     * numbering ever restarted lower, a seeded validator would discard everything as duplicates.
+     * FIX 4 (step 7): the highest version on Kafka is a composite (epoch, sequence), so it is split
+     * back before it becomes the resume position — used as a bare sequence it would ask the provider
+     * for a sequence that does not exist, and nothing would be replayed.
+     *
+     * <p>The validator is seeded with that position. That is safe now that positions carry the
+     * epoch: a provider that restarted its numbering arrives with a higher epoch and is a
+     * NEW_SESSION, not a stream of duplicates. Seeding also means the very first message after a
+     * restart goes through the normal gap / new-session checks, with no special case.
      */
-    private long resumeCursor() {
-        long processed = sequenceValidator.lastProcessedSequence();
-        return processed >= 0 ? processed : lastPublishedAtStartup;
+    private void resumeFrom(long lastPublishedVersion) {
+        if (lastPublishedVersion < 0) {
+            log.info("RESUME_CURSOR_FROM_KAFKA topic=empty note=asking-for-everything-the-provider-holds");
+            return;
+        }
+        long epoch = ProviderVersion.epochOf(lastPublishedVersion);
+        long sequence = ProviderVersion.sequenceOf(lastPublishedVersion);
+        sequenceValidator.resetTo(epoch, sequence);
+        log.info("RESUME_CURSOR_FROM_KAFKA lastPublishedVersion={} sessionEpoch={} sequence={}",
+                lastPublishedVersion, epoch, sequence);
     }
 
     private void startPipeline() {
@@ -99,7 +106,8 @@ public class OddsFeedVerticle extends AbstractVerticle {
         providerClient = new ProviderStreamClient(vertx, config.providerUrl(), config.providerConnectTimeout(),
                 new ReconnectBackoff(config.reconnectInitialDelay(), config.reconnectMaxDelay()),
                 metrics.oddsFeedMessagesInvalidTotal,
-                this::resumeCursor);
+                sequenceValidator::lastProcessedEpoch,
+                sequenceValidator::lastProcessedSequence);
         log.info("ODDS_FEED_PIPELINE_STARTING providerUrl={} topic={} bootstrap={}",
                 config.providerUrl(), config.sportsEventsTopic(), config.kafkaBootstrapServers());
 
@@ -113,8 +121,9 @@ public class OddsFeedVerticle extends AbstractVerticle {
         pipeline = providerClient.messages()
                 .concatMapCompletable(this::process)
                 .retryWhen(failures -> failures.concatMap(failure -> {
-                    log.warn("ODDS_FEED_PIPELINE_RESTARTING reason={} resumeAfterSequence={} retryInMs={}",
-                            failure.getMessage(), resumeCursor(), PIPELINE_RESTART_MS);
+                    log.warn("ODDS_FEED_PIPELINE_RESTARTING reason={} resumeAfterEpoch={} resumeAfterSequence={} retryInMs={}",
+                            failure.getMessage(), sequenceValidator.lastProcessedEpoch(),
+                            sequenceValidator.lastProcessedSequence(), PIPELINE_RESTART_MS);
                     return Flowable.timer(PIPELINE_RESTART_MS, TimeUnit.MILLISECONDS, RxHelper.scheduler(vertx));
                 }))
                 .subscribe(
@@ -169,7 +178,7 @@ public class OddsFeedVerticle extends AbstractVerticle {
             if (suspensions.isEmpty()) {
                 return Completable.complete();
             }
-            log.warn("MARKETS_SUSPENDED_ON_GAP markets={} version={} receivedSequence={}",
+            log.warn("MARKETS_SUSPENDED_ON_GAP markets={} version={} receivedVersion={}",
                     suspensions.size(), receivedVersion - 1, receivedVersion);
             metrics.oddsFeedGapSuspensionsTotal.addAndGet(suspensions.size());
             return Flowable.fromIterable(suspensions)
@@ -206,15 +215,6 @@ public class OddsFeedVerticle extends AbstractVerticle {
         long sequence = message.sequenceNumber();
         long sessionEpoch = message.sessionEpoch();
         SequenceDecision decision = sequenceValidator.decide(sessionEpoch, sequence);
-
-        // First message of a restarted process: the validator is deliberately unseeded, so compare
-        // with the cursor we asked the provider to resume from. A jump means the replay could not
-        // cover everything we were missing.
-        if (sequenceValidator.lastProcessedSequence() < 0 && lastPublishedAtStartup >= 0
-                && sequence > lastPublishedAtStartup + 1) {
-            reportGap(lastPublishedAtStartup + 1, sequence);
-            return SequenceOutcome.PROCESS_AFTER_GAP;
-        }
 
         return switch (decision) {
             case IN_ORDER -> SequenceOutcome.PROCESS;

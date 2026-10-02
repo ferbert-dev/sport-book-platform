@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 168 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 175 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -224,20 +224,29 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   messages (`PRICE_CHANGE`, `MARKET_LOCK`...) into `ProviderFeed`, never domain events to Kafka.
 - **`provider-simulator` does not depend on `common-domain`.** The contract is the JSON on the wire;
   each side has its own `ProviderMessage`, as it would with a real vendor.
-- **`ProviderFeed` numbers the whole stream** with one sequence. `SequenceReservation` persists a
-  reserved block (hi/lo) to `SIMULATOR_SEQUENCE_FILE` (temp file + atomic rename, one write at a
+- **Stream positions are (session epoch, sequence)** and the event version is
+  `ProviderVersion.compose(epoch, sequence)` = `epoch × 10¹⁵ + sequence` (so `2000000000000001` reads
+  as session 2, message 1). A provider that restarts its numbering sends a higher epoch; versions
+  keep growing, so the projection's guard is untouched. Anything that builds a version — gap
+  suspensions included — must use the composite version, never the bare sequence. The worker logs
+  `PROVIDER_SESSION_CHANGED` and treats the switch like a gap (suspend + quarantine); a message
+  from an older epoch is dropped (`PROVIDER_STALE_SESSION_DROPPED`). `POST /dev/session/restart`
+  makes the simulator do exactly that.
+- **`ProviderFeed` numbers each session** with one sequence. `SequenceReservation` persists
+  `epoch:reservedUpTo` (hi/lo) to `SIMULATOR_SEQUENCE_FILE` (temp file + atomic rename, one write at a
   time) before using it, and the feed **fails closed** past the last durable block, so a restart
   always starts above every sequence handed out — even after a clock rollback or a burst faster
   than 1 msg/ms.
   The feed is confined to `SimulatorVerticle`'s context — everything that feeds it runs there, so it
   needs no locks.
-- **Resume, not just reconnect.** The feed keeps a replay window; the worker connects with
-  `?fromSequence=<cursor>` (always — `0` when nothing is delivered yet) and gets what it missed
-  before live traffic. The cursor is the last sequence **Kafka acknowledged**: the worker marks a
+- **Resume, not just reconnect.** The feed keeps a replay window across sessions; the worker
+  connects with `?sessionEpoch=<e>&fromSequence=<cursor>` (always — `0`/`0` when nothing is
+  delivered yet) and gets what it missed, the rest of that session and any later one, before live
+  traffic. The cursor is the last sequence **Kafka acknowledged**: the worker marks a
   sequence processed only after the publish succeeds, and a publish that keeps failing restarts the
   pipeline so the provider replays it. Right after startup the cursor is the highest `version`
   already on `sports-events` (`LastPublishedSequence`; an unreadable topic is retried, never read
-  as empty). Replay and the live subscription happen in one event-loop turn, so nothing slips
+  as empty), split back into epoch and sequence. Replay and the live subscription happen in one event-loop turn, so nothing slips
   between.
 - **Nothing starts on its own.** `FEED_AUTOPLAY` defaults to `false` and the demo page tracks no
   event on load: matches start from the dev panel. `ScriptedMatch` (`event-123`) is opt-in —
@@ -245,16 +254,17 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   duplicate and one gap per cycle so those paths run at runtime, not only in tests.
 - **A gap suspends every active market** (`GapSuspension`, `MARKETS_SUSPENDED_ON_GAP`): a lost
   `MARKET_LOCK` would otherwise leave a market `ACTIVE` while prices keep flowing past the staleness
-  sweep. The synthetic `MARKET_SUSPENDED` is versioned `receivedSequence - 1` — above everything
-  stored for the market, below the provider's next message — so the provider's own `MARKET_UNLOCK`
+  sweep. The synthetic `MARKET_SUSPENDED` is versioned `receivedVersion - 1` — above everything
+  stored for the market, below the provider's next message (both composite versions) — so the provider's own `MARKET_UNLOCK`
   still reopens it. `ActiveMarkets` is in memory and built from acknowledged publishes only; the
   worker never reads Redis to rebuild it. Because a restarted worker starts with an empty list,
   once any gap is seen a market it has not published yet is **quarantined**: suspended just before
   its first price (`MARKET_QUARANTINED_AFTER_GAP`). It skips markets it saw settled; for ones settled
   before it started, the projection's terminal `SETTLED` rule (invariant 4) ignores the suspension.
 - The worker's `SequenceValidator` is **not** reset per connection (anything the replay window no
-  longer holds must surface as a gap), and it is **not** seeded from Kafka: if a provider's
-  numbering ever restarted lower, a seeded validator would drop everything as duplicates.
+  longer holds must surface as a gap). At startup it **is** seeded from the Kafka cursor: with the
+  epoch in the position, a provider that restarted its numbering shows up as a new session rather
+  than as duplicates, and the first message after a restart goes through the normal checks.
 
 ## Logging
 
