@@ -160,8 +160,8 @@ public class SimulatorVerticle extends AbstractVerticle {
                 .rxListen(config.port())
                 .doOnSuccess(started -> {
                     server = started;
-                    log.info("PROVIDER_SIMULATOR_LISTENING port={} streamPath={} firstSequence={}",
-                            config.port(), config.streamPath(), feed.lastSequence() + 1);
+                    log.info("PROVIDER_SIMULATOR_LISTENING port={} streamPath={} sessionEpoch={} firstSequence={}",
+                            config.port(), config.streamPath(), feed.sessionEpoch(), feed.lastSequence() + 1);
                 })
                 .ignoreElement();
     }
@@ -219,6 +219,41 @@ public class SimulatorVerticle extends AbstractVerticle {
         ok(ctx, new JsonObject().put("eventId", eventId).put("stopped", stopped));
     }
 
+    /**
+     * FIX 4: starts a new provider session. The new session is made durable FIRST and the feed is
+     * switched only once that write has landed; switching first and crashing before the write would
+     * bring the simulator back on the old epoch after workers had already seen the new one.
+     *
+     * <p>Refused with 409 while a reservation write is in flight: that write carries the old epoch
+     * and could land after ours, putting the old session back on disk. The caller retries.
+     */
+    private void restartSession(RoutingContext ctx) {
+        if (reservationWriteInFlight) {
+            ctx.response().setStatusCode(409).putHeader("content-type", "application/json")
+                    .end(new JsonObject().put("error", "RESERVATION_WRITE_IN_PROGRESS").encode());
+            return;
+        }
+        long oldEpoch = reservation.epoch();
+        SequenceReservation next = reservation.nextSession(SequenceReservation.DEFAULT_BLOCK);
+        reservationWriteInFlight = true;
+        persistReservation(next.epoch(), next.reservedUpTo()).subscribe(
+                () -> {
+                    reservation = next;
+                    durableUpTo = next.reservedUpTo();
+                    feed.startNewSession(next.epoch());
+                    feed.setEmitLimit(durableUpTo);
+                    reservationWriteInFlight = false;
+                    log.warn("PROVIDER_SESSION_RESTARTED oldEpoch={} newEpoch={} nextSequence=1", oldEpoch, next.epoch());
+                    ok(ctx, new JsonObject().put("sessionEpoch", next.epoch()).put("nextSequence", 1));
+                },
+                error -> {
+                    reservationWriteInFlight = false;
+                    log.error("PROVIDER_SESSION_RESTART_FAILED oldEpoch={}", oldEpoch, error);
+                    ctx.response().setStatusCode(500).putHeader("content-type", "application/json")
+                            .end(new JsonObject().put("error", "SESSION_RESTART_FAILED").encode());
+                });
+    }
+
     private JsonObject scriptedStatus() {
         return new JsonObject()
                 .put("eventId", config.scriptedEventId())
@@ -233,8 +268,12 @@ public class SimulatorVerticle extends AbstractVerticle {
 
         router.get("/dev/health").handler(ctx -> ok(ctx, new JsonObject()
                 .put("status", "UP")
+                .put("sessionEpoch", feed.sessionEpoch())
                 .put("lastSequence", feed.lastSequence())
                 .put("scripted", scriptedStatus())));
+
+        // FIX 4: act like a provider that restarted — new session epoch, numbering from 1 again.
+        router.post("/dev/session/restart").handler(this::restartSession);
 
         // Stop all generated traffic for one event, scripted or dev match.
         router.post("/dev/events/:eventId/stop").handler(this::stopEventTraffic);
