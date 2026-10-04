@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -22,6 +23,11 @@ import java.util.Set;
  * Continuing to accept bets against them is the dangerous failure mode, so any market not updated
  * within the freshness threshold is flipped to SUSPENDED. Bet Service independently re-checks
  * freshness on every bet, so this sweep is a safety net rather than the only guard.
+ *
+ * <p>The suspension is written with {@code suspendReason=STALE_FEED}. It is a statement about our
+ * feed, not about the market, so it ends when the feed is back: {@link MarketStateProjection}
+ * reopens the market on the next price. This write produces no Kafka event, so stream clients
+ * learn about it from the REST snapshot.
  */
 @Service
 public class StalenessDetector {
@@ -71,7 +77,11 @@ public class StalenessDetector {
         if (updated.isAfter(cutoff)) {
             return;
         }
-        redis.opsForHash().put(key, RedisKeys.FIELD_STATUS, MarketStatus.SUSPENDED.name());
+        // The reason marks this as OUR suspension, not the provider's: the projection reopens the
+        // market when a price arrives again, and odds-service shows it to clients.
+        redis.opsForHash().putAll(key, Map.of(
+                RedisKeys.FIELD_STATUS, MarketStatus.SUSPENDED.name(),
+                RedisKeys.FIELD_SUSPEND_REASON, RedisKeys.SUSPEND_REASON_STALE_FEED));
         staleSuspensions.increment();
         log.warn("MARKET_SUSPENDED_STALE_FEED marketId={} lastUpdatedAt={} thresholdSeconds={}",
                 marketId, updated, Duration.ofMillis(properties.marketFreshnessThreshold().toMillis()).toSeconds());

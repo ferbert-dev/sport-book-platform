@@ -32,7 +32,7 @@ class EventSnapshotServiceTest {
         when(repository.findMarketIds("event-123")).thenReturn(Set.of("market-456"));
         when(repository.findMarket("market-456")).thenReturn(Optional.of(
                 new EventStateRepository.MarketState("market-456", "event-123",
-                        MarketStatus.ACTIVE, 1003, updatedAt)));
+                        MarketStatus.SUSPENDED, 1003, updatedAt, "STALE_FEED")));
         Map<String, BigDecimal> odds = new LinkedHashMap<>();
         odds.put("draw", new BigDecimal("3.40"));
         odds.put("real-madrid", new BigDecimal("2.10"));
@@ -43,7 +43,9 @@ class EventSnapshotServiceTest {
         assertThat(snapshot.eventId()).isEqualTo("event-123");
         assertThat(snapshot.status()).isEqualTo(EventStatus.LIVE);
         assertThat(snapshot.markets()).hasSize(1);
-        assertThat(snapshot.markets().getFirst().status()).isEqualTo(MarketStatus.ACTIVE);
+        assertThat(snapshot.markets().getFirst().status()).isEqualTo(MarketStatus.SUSPENDED);
+        // The only way a client learns of a staleness suspension: it is never on the stream.
+        assertThat(snapshot.markets().getFirst().suspendReason()).isEqualTo("STALE_FEED");
         assertThat(snapshot.markets().getFirst().version()).isEqualTo(1003);
         assertThat(snapshot.markets().getFirst().selections())
                 .extracting(s -> s.selectionId() + "@" + s.odds().toPlainString())

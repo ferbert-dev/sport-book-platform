@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 179 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 187 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -109,8 +109,14 @@ Client → bet-service → Redis (validate) → Postgres (bet + outbox) → Kafk
    `incoming.version > stored.version`. This is what makes the projection idempotent under Kafka's
    at-least-once delivery, and it is what makes correctness independent of arrival order. New event
    handling in `MarketStateProjection` must go through it.
-4. **`ODDS_UPDATED` must not touch market status.** A price may move while a market is suspended;
-   reopening must not resurrect a stale price.
+4. **`ODDS_UPDATED` must not touch a market status the feed set.** A price may move while a market
+   is suspended; reopening must not resurrect a stale price. The single exception is the staleness
+   sweep's own suspension: `StalenessDetector` writes `suspendReason=STALE_FEED` next to
+   `SUSPENDED`, and the next applied price reopens that market (`MARKET_REOPENED_FEED_RECOVERED`),
+   because that suspension only ever meant "no prices are arriving". Every status event from the
+   feed deletes the reason, so a provider or gap suspension still needs `MARKET_OPENED`. The sweep
+   writes Redis directly (no Kafka event), so clients see it only in the REST snapshot
+   (`suspendReason`); the demo page polls the snapshot to reconcile status.
    **`SETTLED` is terminal** in `MarketStateProjection`: a newer `MARKET_SUSPENDED`/`MARKET_OPENED`
    for a settled market is ignored (`MARKET_STATUS_AFTER_SETTLEMENT_IGNORED`). The feed worker cannot
    know markets settled before it started, so this guard lives where the settled state lives.
