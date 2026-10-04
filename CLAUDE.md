@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 187 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 190 unit + 7 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -237,7 +237,9 @@ panel uses (nginx proxies `/dev/` to it). Keep it that way:
   suspensions included — must use the composite version, never the bare sequence. The worker logs
   `PROVIDER_SESSION_CHANGED` and treats the switch like a gap (suspend + quarantine); a message
   from an older epoch is dropped (`PROVIDER_STALE_SESSION_DROPPED`). `POST /dev/session/restart`
-  makes the simulator do exactly that.
+  makes the simulator do exactly that, and then re-announces the status of every live dev match
+  (`ManualMatchDirector.announceMarketStates`) as a provider's recovery snapshot would, so open
+  markets reopen through the provider's own `MARKET_UNLOCK`.
 - **`ProviderFeed` numbers each session** with one sequence. `SequenceReservation` persists
   `epoch:reservedUpTo` (hi/lo) to `SIMULATOR_SEQUENCE_FILE` (temp file + atomic rename, one write at a
   time) before using it, and the feed **fails closed** past the last durable block, so a restart

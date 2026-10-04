@@ -560,8 +560,10 @@ published to the host, so the curl and WebSocket examples below work unchanged.
 **Restart provider session** in the dev panel (`POST /dev/session/restart`) makes the simulator act
 like a provider that restarted: the session epoch goes up by one and its sequence starts again at 1.
 The page shows versions as `e<epoch> #<sequence>`, so the switch is visible: on the next message the
-worker suspends every active market at `e3 #0`, prices continue as `e3 #1…`, and only **Open
-market** reopens it. The page reads versions as `BigInt`: from epoch 10 a version is above 2^53 and
+worker suspends every active market at `e3 #0`. A price never reopens such a market, only the
+provider's own unlock, so the simulator opens the new session the way a real provider does after a
+restart: it re-announces the status of every live dev match (`MARKET_UNLOCK` or `MARKET_LOCK`). An
+open market is therefore suspended and reopened a moment later; one you suspended stays closed. The page reads versions as `BigInt`: from epoch 10 a version is above 2^53 and
 would no longer be exact as a JavaScript number.
 
 #### The demo UI
@@ -837,7 +839,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-194 tests: 187 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+197 tests: 190 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |

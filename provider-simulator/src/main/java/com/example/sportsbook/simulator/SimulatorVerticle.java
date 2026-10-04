@@ -227,6 +227,10 @@ public class SimulatorVerticle extends AbstractVerticle {
      * <p>Refused with 409 while a reservation write is in flight: that write carries the old epoch
      * and could land after ours, putting the old session back on disk. The caller retries. While our
      * write is in flight, block extensions wait; both outcomes flush whatever is pending afterwards.
+     *
+     * <p>The new session opens with a recovery snapshot of the dev matches
+     * ({@link ManualMatchDirector#announceMarketStates}). The scripted match is not announced: its
+     * loop sends its own status messages within a few steps.
      */
     private void restartSession(RoutingContext ctx) {
         if (reservationWriteInFlight) {
@@ -245,8 +249,15 @@ public class SimulatorVerticle extends AbstractVerticle {
                     feed.setEmitLimit(durableUpTo);
                     reservationWriteInFlight = false;
                     flushReservation();
-                    log.warn("PROVIDER_SESSION_RESTARTED oldEpoch={} newEpoch={} nextSequence=1", oldEpoch, next.epoch());
-                    ok(ctx, new JsonObject().put("sessionEpoch", next.epoch()).put("nextSequence", 1));
+                    // Like a real provider after a restart: say where every live market stands, as
+                    // the first messages of the new session. Without it the worker's suspension on
+                    // the session change would hold until someone unlocked each market by hand.
+                    int announced = director.announceMarketStates();
+                    log.warn("PROVIDER_SESSION_RESTARTED oldEpoch={} newEpoch={} marketsAnnounced={}",
+                            oldEpoch, next.epoch(), announced);
+                    ok(ctx, new JsonObject().put("sessionEpoch", next.epoch())
+                            .put("nextSequence", feed.lastSequence() + 1)
+                            .put("marketsAnnounced", announced));
                 },
                 error -> {
                     reservationWriteInFlight = false;

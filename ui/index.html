@@ -153,8 +153,10 @@
       restarted: the session epoch goes up by one and its sequence starts again at 1. Versions are
       shown as <code>e&lt;epoch&gt; #&lt;sequence&gt;</code>, so <code>e3 #1</code> still outranks
       everything from epoch 2. The feed worker cannot know what the old session sent last, so on the
-      next message it suspends every active market at <code>e3 #0</code> first; prices keep flowing,
-      and only <strong>Open market</strong> (the provider's own unlock) reopens it.
+      first message of the new session it suspends every active market at <code>e3 #0</code>. A price
+      never reopens such a market; only the provider's own unlock does. So the simulator, like a real
+      provider after a restart, opens the new session by re-announcing every live dev match's market
+      status: an open market is suspended and reopened a moment later, one you suspended stays closed.
     </p>
   </div>
 
@@ -270,7 +272,7 @@
     if (state.epoch !== null && epoch <= state.epoch) return;
     if (announce && state.epoch !== null) {
       log(`provider session changed: epoch ${state.epoch} → ${epoch} — the worker treats it like a gap `
-          + `and suspends every active market`, "session");
+          + `and suspends every active market until the provider states its status again`, "session");
     }
     state.epoch = epoch;
   }
@@ -904,8 +906,10 @@
     $("restartSessionBtn").disabled = true;
     try {
       const next = await dev("/session/restart");
-      log(`dev: provider session restarted — epoch ${next.sessionEpoch}, numbering starts again at `
-          + `${next.nextSequence}. The next message shows how the worker reacts.`, "session");
+      log(`dev: provider session restarted — epoch ${next.sessionEpoch}, numbering starts again at 1. `
+          + (next.marketsAnnounced
+              ? `The provider re-announced the status of ${next.marketsAnnounced} market(s).`
+              : `No live dev match to re-announce; the next message shows how the worker reacts.`), "session");
     } catch (e) {
       log(e.message === "RESERVATION_WRITE_IN_PROGRESS"
             ? "dev: session restart refused — the simulator is still saving its sequence block, try again"

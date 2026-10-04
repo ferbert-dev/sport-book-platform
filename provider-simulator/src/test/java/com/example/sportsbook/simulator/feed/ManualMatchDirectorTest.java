@@ -75,4 +75,44 @@ class ManualMatchDirectorTest {
 
         assertThat(first.eventId()).startsWith("event-").isNotEqualTo(second.eventId());
     }
+
+    // Recovery snapshot after a provider restart
+
+    @Test
+    void afterARestartEveryLiveMarketIsAnnouncedWithItsCurrentStatus() {
+        ManualMatch open = director.startMatch("open-1");
+        ManualMatch locked = director.startMatch("locked-1");
+        director.suspend(locked);
+        feed.startNewSession(2);
+        TestSubscriber<ProviderMessage> sent = feed.messages().test();
+
+        int announced = director.announceMarketStates();
+
+        assertThat(announced).isEqualTo(2);
+        assertThat(sent.values()).extracting(message -> message.matchId() + ":" + message.messageType())
+                .containsExactlyInAnyOrder(open.eventId() + ":MARKET_UNLOCK", locked.eventId() + ":MARKET_LOCK");
+        assertThat(sent.values()).allSatisfy(message -> assertThat(message.sessionEpoch()).isEqualTo(2));
+    }
+
+    @Test
+    void aMarketReopenedByHandIsAnnouncedAsUnlocked() {
+        ManualMatch match = director.startMatch("derby-1");
+        director.suspend(match);
+        director.open(match);
+        TestSubscriber<ProviderMessage> sent = feed.messages().test();
+
+        director.announceMarketStates();
+
+        assertThat(sent.values()).extracting(ProviderMessage::messageType).containsExactly("MARKET_UNLOCK");
+    }
+
+    @Test
+    void settledMatchesAreNotAnnounced() {
+        ManualMatch match = director.startMatch("derby-1");
+        director.settle(match, null);
+        TestSubscriber<ProviderMessage> sent = feed.messages().test();
+
+        assertThat(director.announceMarketStates()).isZero();
+        assertThat(sent.values()).isEmpty();
+    }
 }
