@@ -77,6 +77,7 @@
   #log .sys { color: var(--accent); }
   #log .err { color: var(--down); }
   #log .money { color: var(--up); }
+  #log .session { color: var(--warn); font-weight: 600; }
   #betResult { margin-top: 10px; font-family: var(--mono); font-size: 12px; }
   .ok { color: var(--up); }
   .bad { color: var(--down); }
@@ -132,6 +133,11 @@
       <select id="winnerSel" disabled><option value="">random</option></select>
       <button id="settleBtn" disabled>Finish &amp; settle</button>
     </div>
+    <div class="row" style="margin-top:10px">
+      <button id="restartSessionBtn"
+              title="The provider restarts: session epoch + 1, sequence numbering starts again at 1.">Restart provider session</button>
+      <span id="sessionInfo" class="meta">provider session: &mdash;</span>
+    </div>
     <p class="note">
       <strong>Start match</strong> creates a match under the id you type (or a generated one if the
       field is empty) with random teams and prices on the <strong>provider simulator</strong>, which
@@ -143,6 +149,12 @@
       being tracked <em>with live updates confirmed</em>, and stops on settlement, on a dropped or
       unconfirmed stream, or when you track something else. The page renews it every 2&nbsp;s; close the
       tab and the simulator stops it within 5&nbsp;s &mdash; a demo should never leave traffic running unwatched.
+      <br><strong>Restart provider session</strong> makes the simulator act like a provider that
+      restarted: the session epoch goes up by one and its sequence starts again at 1. Versions are
+      shown as <code>e&lt;epoch&gt; #&lt;sequence&gt;</code>, so <code>e3 #1</code> still outranks
+      everything from epoch 2. The feed worker cannot know what the old session sent last, so on the
+      next message it suspends every active market at <code>e3 #0</code> first; prices keep flowing,
+      and only <strong>Open market</strong> (the provider's own unlock) reopens it.
     </p>
   </div>
 
@@ -227,7 +239,41 @@
     openBets: [],
     lastBet: null,
     devMatch: null,
+    // Highest provider session epoch seen in a version; a higher one is announced in the log.
+    epoch: null,
   };
+
+  // ---------------------------------------------------------------- versions
+  /**
+   * A version is epoch x 10^15 + sequence. From epoch 10 that is above 2^53, where a JS number
+   * stops being exact and the version guard below would compare rounded values. So versions are
+   * lifted out of the raw JSON text as BigInt and never pass through a number.
+   */
+  const EPOCH_FACTOR = 10n ** 15n;
+  const NO_VERSION = -1n;
+
+  function parseJson(text) {
+    return JSON.parse(text.replace(/"version"\s*:\s*(-?\d+)/g, '"version":"$1"'),
+        (key, value) => key === "version" && typeof value === "string" ? BigInt(value) : value);
+  }
+
+  /** "e3 #1" = session epoch 3, sequence 1. Epoch 0 is a version with no session in it. */
+  function fmtVersion(version) {
+    if (typeof version !== "bigint" || version < 0n) return "";
+    const epoch = version / EPOCH_FACTOR;
+    return epoch > 0n ? `e${epoch} #${version % EPOCH_FACTOR}` : `#${version}`;
+  }
+
+  function noteEpoch(version, announce) {
+    if (typeof version !== "bigint" || version < 0n) return;
+    const epoch = version / EPOCH_FACTOR;
+    if (state.epoch !== null && epoch <= state.epoch) return;
+    if (announce && state.epoch !== null) {
+      log(`provider session changed: epoch ${state.epoch} → ${epoch} — the worker treats it like a gap `
+          + `and suspends every active market`, "session");
+    }
+    state.epoch = epoch;
+  }
 
   // ---------------------------------------------------------------- logging
   function log(msg, cls = "applied") {
@@ -447,7 +493,7 @@
 
   function handleFrame(raw) {
     let msg;
-    try { msg = JSON.parse(raw); } catch { log(`unparseable frame: ${raw}`, "err"); return; }
+    try { msg = parseJson(raw); } catch { log(`unparseable frame: ${raw}`, "err"); return; }
 
     if (msg.action) {
       if (msg.action === "SUBSCRIBED" && state.pendingAck
@@ -472,14 +518,16 @@
       log("live updates confirmed by incoming data", "sys");
     }
 
+    noteEpoch(msg.version, true);
+
     if (state.buffering) {
       state.buffer.push(msg);
-      log(`${msg.type} v${msg.version} buffered`, "buffered");
+      log(`${msg.type} ${fmtVersion(msg.version)} buffered`, "buffered");
       return;
     }
 
     const applied = apply(msg);
-    log(`${msg.type} v${msg.version} ${applied ? "applied" : "ignored (not newer than local state)"}`,
+    log(`${msg.type} ${fmtVersion(msg.version)} ${applied ? "applied" : "ignored (not newer than local state)"}`,
         applied ? "applied" : "ignored");
     // Redelivery is expected under at-least-once, and the version guard discards it.
     // Settling must not depend on that guard: resolveBets is idempotent per bet, so a
@@ -490,8 +538,8 @@
 
   function apply(ev) {
     if (ev.type === "MATCH_STARTED" || ev.type === "MATCH_FINISHED") {
-      if (!state.event) state.event = { eventId: ev.eventId, status: null, version: -1 };
-      if (ev.version <= (state.event.version ?? -1)) return false;
+      if (!state.event) state.event = { eventId: ev.eventId, status: null, version: NO_VERSION };
+      if (ev.version <= (state.event.version ?? NO_VERSION)) return false;
       state.event.version = ev.version;
       state.event.status = ev.type === "MATCH_STARTED" ? "LIVE" : "FINISHED";
       return true;
@@ -500,7 +548,7 @@
 
     let m = state.markets.get(ev.marketId);
     if (!m) {
-      m = { marketId: ev.marketId, status: "SUSPENDED", version: -1, statusVersion: -1, suspendReason: null,
+      m = { marketId: ev.marketId, status: "SUSPENDED", version: NO_VERSION, statusVersion: NO_VERSION, suspendReason: null,
             lastUpdatedAt: null, odds: new Map() };
       state.markets.set(ev.marketId, m);
     }
@@ -546,7 +594,7 @@
         return;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      snap = await res.json();
+      snap = parseJson(await res.text());
     } catch (e) {
       log(`snapshot failed: ${e.message}`, "err");
       return;
@@ -556,14 +604,16 @@
       return;
     }
 
-    if (!state.event || (snap.version ?? 0) > (state.event.version ?? -1) || state.event.status == null) {
-      state.event = { eventId: snap.eventId, status: snap.status, version: state.event?.version ?? -1 };
+    if (!state.event || (snap.version ?? 0n) > (state.event.version ?? NO_VERSION) || state.event.status == null) {
+      state.event = { eventId: snap.eventId, status: snap.status, version: state.event?.version ?? NO_VERSION };
     }
 
     // Merge under the same version guard rather than clobbering: the stream may already have
     // carried this market past what Redis had when the snapshot was read.
     let installed = 0, skipped = 0;
     for (const m of snap.markets || []) {
+      // The snapshot only sets the baseline; a session change is announced when it arrives live.
+      noteEpoch(m.version, false);
       const local = state.markets.get(m.marketId);
       if (local && local.version >= m.version) { skipped++; continue; }
       state.markets.set(m.marketId, {
@@ -595,7 +645,7 @@
     try {
       const res = await fetch(`/api/v1/events/${encodeURIComponent(eventId)}`);
       if (!res.ok) return;
-      snap = await res.json();
+      snap = parseJson(await res.text());
     } catch (e) {
       return;
     }
@@ -628,7 +678,8 @@
       const s = state.event.status ?? "unknown";
       $("evStatus").textContent = s;
       $("evStatus").className = "pill " + String(s).toLowerCase();
-      $("evMeta").textContent = state.event.version >= 0 ? `v${state.event.version}` : "";
+      $("evMeta").textContent = fmtVersion(state.event.version);
+      $("evMeta").title = state.event.version >= 0n ? `version ${state.event.version}` : "";
     } else {
       $("evId").textContent = "—";
       $("evStatus").textContent = "unknown";
@@ -650,7 +701,8 @@
       head.innerHTML = `<strong>${esc(m.marketId)}</strong>
         <span class="pill ${String(m.status).toLowerCase()}">${esc(m.status)}${
             m.suspendReason ? " · " + esc(m.suspendReason.toLowerCase().replace("_", " ")) : ""}</span>
-        <span class="meta">v${m.version}${m.lastUpdatedAt ? " · " + esc(shortTime(m.lastUpdatedAt)) : ""}</span>`;
+        <span class="meta" title="version ${m.version}">${fmtVersion(m.version)}${
+            m.lastUpdatedAt ? " · " + esc(shortTime(m.lastUpdatedAt)) : ""}</span>`;
       box.appendChild(head);
 
       const table = document.createElement("table");
@@ -833,6 +885,38 @@
     }
   }
 
+  // ---------------------------------------------------------------- provider session
+  /**
+   * The session lives in the provider simulator; this only shows it and asks for the next one.
+   * The simulator always moves to epoch + 1 (a provider restart), so there is nothing to type.
+   */
+  async function refreshSession() {
+    try {
+      const health = await dev("/health", "GET");
+      $("sessionInfo").textContent =
+          `provider session: epoch ${health.sessionEpoch} · last sequence ${health.lastSequence}`;
+    } catch (e) {
+      $("sessionInfo").textContent = "provider session: simulator unreachable";
+    }
+  }
+
+  async function restartSession() {
+    $("restartSessionBtn").disabled = true;
+    try {
+      const next = await dev("/session/restart");
+      log(`dev: provider session restarted — epoch ${next.sessionEpoch}, numbering starts again at `
+          + `${next.nextSequence}. The next message shows how the worker reacts.`, "session");
+    } catch (e) {
+      log(e.message === "RESERVATION_WRITE_IN_PROGRESS"
+            ? "dev: session restart refused — the simulator is still saving its sequence block, try again"
+            : `dev: session restart failed — ${e.message}`, "err");
+    } finally {
+      $("restartSessionBtn").disabled = false;
+      refreshSession();
+    }
+  }
+  setInterval(refreshSession, 3000);
+
   // ---------------------------------------------------------------- auto-drift
   /**
    * Auto-drift runs IN THE PROVIDER SIMULATOR, not here: the provider is what sends the feed,
@@ -992,6 +1076,7 @@
   $("wsBtn").onclick    = toggleStream;
   $("stopEventBtn").onclick = stopEvent;
   $("newMatchBtn").onclick = newMatch;
+  $("restartSessionBtn").onclick = restartSession;
   $("newEventId").onkeydown = (e) => { if (e.key === "Enter") newMatch(); };
   $("driftBtn").onclick    = () => devAction("/odds", "moved odds");
   $("autoDriftBtn").onclick = toggleAutoDrift;
@@ -1012,6 +1097,7 @@
 
   renderBalance();
   renderAutoDrift();
+  refreshSession();
   syncTo($("eventId").value.trim());
 })();
 </script>

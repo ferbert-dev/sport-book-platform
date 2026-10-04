@@ -557,6 +557,13 @@ that match through the feed worker, the projection fills, and a bet on it settle
 below use). Ports `8081`–`8085`, `9092`, `6379` and `5432` are
 published to the host, so the curl and WebSocket examples below work unchanged.
 
+**Restart provider session** in the dev panel (`POST /dev/session/restart`) makes the simulator act
+like a provider that restarted: the session epoch goes up by one and its sequence starts again at 1.
+The page shows versions as `e<epoch> #<sequence>`, so the switch is visible: on the next message the
+worker suspends every active market at `e3 #0`, prices continue as `e3 #1…`, and only **Open
+market** reopens it. The page reads versions as `BigInt`: from epoch 10 a version is above 2^53 and
+would no longer be exact as a JavaScript number.
+
 #### The demo UI
 
 A single static page (`ui/index.html`, no build step and no framework) served by nginx, which also
