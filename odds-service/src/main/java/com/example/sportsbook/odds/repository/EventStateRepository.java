@@ -58,7 +58,9 @@ public class EventStateRepository {
                 String.valueOf(fields.get(RedisKeys.FIELD_EVENT_ID)),
                 enumOrDefault(fields.get(RedisKeys.FIELD_STATUS), MarketStatus.SUSPENDED),
                 parseLong(fields.get(RedisKeys.FIELD_VERSION)),
-                parseInstant(fields.get(RedisKeys.FIELD_LAST_UPDATED_AT))));
+                parseInstant(fields.get(RedisKeys.FIELD_LAST_UPDATED_AT)),
+                fields.get(RedisKeys.FIELD_SUSPEND_REASON) == null
+                        ? null : String.valueOf(fields.get(RedisKeys.FIELD_SUSPEND_REASON))));
     }
 
     /** Selection id -> decimal odds, insertion-ordered by selection id. */
@@ -97,6 +99,6 @@ public class EventStateRepository {
     }
 
     public record MarketState(String marketId, String eventId, MarketStatus status, long version,
-                              Instant lastUpdatedAt) {
+                              Instant lastUpdatedAt, String suspendReason) {
     }
 }

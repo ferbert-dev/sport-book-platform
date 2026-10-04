@@ -59,7 +59,14 @@ public class MarketStateProjection {
         registerMarket(event.eventId(), event.marketId());
         redis.opsForHash().put(RedisKeys.marketOdds(event.marketId()),
                 event.selectionId(), event.odds().toPlainString());
-        touchMarket(event.marketId(), event.eventId(), null, event.version());
+        // A price never changes a status the feed set (invariant 4). The one status it does end is
+        // the staleness sweep's own: that one only ever meant "no prices are arriving".
+        boolean feedRecovered = isSuspendedForStaleFeed(event.marketId());
+        touchMarket(event.marketId(), event.eventId(), feedRecovered ? MarketStatus.ACTIVE : null, event.version());
+        if (feedRecovered) {
+            log.warn("MARKET_REOPENED_FEED_RECOVERED eventId={} marketId={} version={}",
+                    event.eventId(), event.marketId(), event.version());
+        }
 
         log.info("ODDS_UPDATED eventId={} marketId={} selectionId={} odds={} version={}",
                 event.eventId(), event.marketId(), event.selectionId(), event.odds(), event.version());
@@ -105,6 +112,16 @@ public class MarketStateProjection {
         return true;
     }
 
+    /**
+     * True only for a suspension written by {@link StalenessDetector}. Every status event from the
+     * feed clears the reason, so a market the provider (or the worker, after a gap) suspended is
+     * never reopened by a price.
+     */
+    private boolean isSuspendedForStaleFeed(String marketId) {
+        Object reason = redis.opsForHash().get(RedisKeys.market(marketId), RedisKeys.FIELD_SUSPEND_REASON);
+        return RedisKeys.SUSPEND_REASON_STALE_FEED.equals(reason);
+    }
+
     private boolean isSettled(String marketId) {
         Object status = redis.opsForHash().get(RedisKeys.market(marketId), RedisKeys.FIELD_STATUS);
         return MarketStatus.SETTLED.name().equals(String.valueOf(status));
@@ -119,7 +136,10 @@ public class MarketStateProjection {
         return raw == null ? null : Long.parseLong(raw.toString());
     }
 
-    /** Writes version and lastUpdatedAt, and status only when the caller supplies one. */
+    /**
+     * Writes version and lastUpdatedAt, and status only when the caller supplies one. Setting a
+     * status also clears any stale-feed suspend reason.
+     */
     private void touchMarket(String marketId, String eventId, MarketStatus status, long version) {
         Map<String, String> fields = new java.util.HashMap<>();
         fields.put(RedisKeys.FIELD_EVENT_ID, eventId);
@@ -129,6 +149,11 @@ public class MarketStateProjection {
             fields.put(RedisKeys.FIELD_STATUS, status.name());
         }
         redis.opsForHash().putAll(RedisKeys.market(marketId), fields);
+        if (status != null) {
+            // Whoever sets a status now owns it; a leftover stale-feed reason would let the next
+            // price reopen a market the provider just suspended.
+            redis.opsForHash().delete(RedisKeys.market(marketId), RedisKeys.FIELD_SUSPEND_REASON);
+        }
     }
 
     private void registerMarket(String eventId, String marketId) {

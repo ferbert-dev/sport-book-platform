@@ -147,13 +147,57 @@ class MarketStateProjectionTest {
     }
 
     @Test
-    void oddsUpdatedDoesNotTouchStatusSoASuspendedMarketStaysSuspended() {
+    void oddsUpdatedDoesNotTouchStatusSoAMarketTheFeedSuspendedStaysSuspended() {
         storedMarketVersion(1002L);
 
         projection.apply(new OddsUpdatedEvent(EVENT_ID, MARKET_ID, "real-madrid",
                 new BigDecimal("1.95"), 1003, now));
 
         assertThat(capturedMarketFields()).doesNotContainKey(RedisKeys.FIELD_STATUS);
+    }
+
+    @Test
+    void aPriceReopensAMarketTheStalenessSweepSuspended() {
+        storedMarketVersion(1002L);
+        when(hash.get(RedisKeys.market(MARKET_ID), RedisKeys.FIELD_SUSPEND_REASON))
+                .thenReturn(RedisKeys.SUSPEND_REASON_STALE_FEED);
+
+        projection.apply(new OddsUpdatedEvent(EVENT_ID, MARKET_ID, "real-madrid",
+                new BigDecimal("1.95"), 1003, now));
+
+        assertThat(capturedMarketFields()).containsEntry(RedisKeys.FIELD_STATUS, MarketStatus.ACTIVE.name());
+        verify(hash).delete(RedisKeys.market(MARKET_ID), RedisKeys.FIELD_SUSPEND_REASON);
+    }
+
+    @Test
+    void aPriceOlderThanTheStoredVersionDoesNotReopenAStaleSuspension() {
+        storedMarketVersion(1005L);
+        when(hash.get(RedisKeys.market(MARKET_ID), RedisKeys.FIELD_SUSPEND_REASON))
+                .thenReturn(RedisKeys.SUSPEND_REASON_STALE_FEED);
+
+        projection.apply(new OddsUpdatedEvent(EVENT_ID, MARKET_ID, "real-madrid",
+                new BigDecimal("1.95"), 1003, now));
+
+        verify(hash, never()).putAll(eq(RedisKeys.market(MARKET_ID)), any());
+    }
+
+    @Test
+    void aStatusEventFromTheFeedTakesOwnershipSoALaterPriceCannotReopenIt() {
+        storedMarketVersion(1002L);
+
+        projection.apply(new MarketSuspendedEvent(EVENT_ID, MARKET_ID, 1003, now));
+
+        verify(hash).delete(RedisKeys.market(MARKET_ID), RedisKeys.FIELD_SUSPEND_REASON);
+    }
+
+    @Test
+    void aPriceLeavesTheSuspendReasonAloneWhenItDoesNotChangeStatus() {
+        storedMarketVersion(1002L);
+
+        projection.apply(new OddsUpdatedEvent(EVENT_ID, MARKET_ID, "real-madrid",
+                new BigDecimal("1.95"), 1003, now));
+
+        verify(hash, never()).delete(any(), any());
     }
 
     @Test

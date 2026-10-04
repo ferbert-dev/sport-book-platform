@@ -37,7 +37,7 @@ class EventControllerTest {
         when(snapshotService.snapshot("event-123")).thenReturn(new EventSnapshotResponse(
                 "event-123", EventStatus.LIVE,
                 List.of(new MarketSnapshot("market-456", MarketStatus.ACTIVE, 1003,
-                        Instant.parse("2026-09-26T10:00:00Z"),
+                        Instant.parse("2026-09-26T10:00:00Z"), null,
                         List.of(new SelectionSnapshot("real-madrid", new BigDecimal("2.10")),
                                 new SelectionSnapshot("draw", new BigDecimal("3.40")))))));
 

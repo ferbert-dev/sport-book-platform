@@ -220,7 +220,7 @@ Written only by `state-processor`; read by `odds-service` and `bet-service`.
 
 ```
 event:{eventId}            hash   status, version, lastUpdatedAt
-market:{marketId}          hash   eventId, status, version, lastUpdatedAt
+market:{marketId}          hash   eventId, status, version, lastUpdatedAt, suspendReason (only while stale-suspended)
 market:{marketId}:odds     hash   selectionId -> odds
 event:{eventId}:markets    set    marketIds of this event
 markets                    set    every known marketId (for the staleness sweep)
@@ -233,7 +233,7 @@ keyspace; `markets` lets the staleness sweep iterate without `KEYS`/`SCAN`.
 
 | Event | Effect |
 | --- | --- |
-| `ODDS_UPDATED` | Set `market:{id}:odds[selectionId]`. **Does not touch status.** |
+| `ODDS_UPDATED` | Set `market:{id}:odds[selectionId]`. **Does not touch status**, except that it reopens a market the staleness sweep suspended (`suspendReason=STALE_FEED`). |
 | `MARKET_SUSPENDED` | `market.status = SUSPENDED` |
 | `MARKET_OPENED` | `market.status = ACTIVE` |
 | `MARKET_SETTLED` | `market.status = SETTLED` |
@@ -255,6 +255,13 @@ That odds updates do not touch status matters. Given this history:
 
 current state is `odds = 1.95, status = ACTIVE` — the price kept moving while suspended, and
 reopening did not resurrect a stale price.
+
+One suspension is different: the one the staleness sweep writes when no price has arrived for 30 s.
+It is a statement about the feed, not about the market, so it is stored with
+`suspendReason = STALE_FEED` and the next applied price ends it. Any status event from the feed
+clears the reason, so a market the provider locked is never reopened by a price. The sweep writes
+Redis directly, without a Kafka event, so stream clients cannot see it; the REST snapshot carries
+`suspendReason`, and the demo page polls it.
 
 ### Why doesn't the feed worker write Redis directly?
 
@@ -823,7 +830,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-186 tests: 179 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+194 tests: 187 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |

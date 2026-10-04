@@ -500,7 +500,8 @@
 
     let m = state.markets.get(ev.marketId);
     if (!m) {
-      m = { marketId: ev.marketId, status: "SUSPENDED", version: -1, lastUpdatedAt: null, odds: new Map() };
+      m = { marketId: ev.marketId, status: "SUSPENDED", version: -1, statusVersion: -1, suspendReason: null,
+            lastUpdatedAt: null, odds: new Map() };
       state.markets.set(ev.marketId, m);
     }
     if (ev.version <= m.version) return false;
@@ -508,14 +509,28 @@
     m.lastUpdatedAt = ev.timestamp;
 
     switch (ev.type) {
-      // Deliberately does not touch status: a price may move while suspended.
-      case "ODDS_UPDATED":     m.odds.set(ev.selectionId, Number(ev.odds)); break;
-      case "MARKET_SUSPENDED": m.status = "SUSPENDED"; break;
-      case "MARKET_OPENED":    m.status = "ACTIVE"; break;
-      case "MARKET_SETTLED":   m.status = "SETTLED"; break;
+      // Deliberately does not touch status: a price may move while suspended. The one exception
+      // mirrors the projection: a STALE_FEED suspension only meant "no prices", so a price ends it.
+      case "ODDS_UPDATED":
+        m.odds.set(ev.selectionId, Number(ev.odds));
+        if (m.suspendReason === "STALE_FEED") {
+          setStatus(m, "ACTIVE", ev.version);
+          log(`${m.marketId} reopened: prices are back after a stale-feed suspension`, "sys");
+        }
+        break;
+      case "MARKET_SUSPENDED": setStatus(m, "SUSPENDED", ev.version); break;
+      case "MARKET_OPENED":    setStatus(m, "ACTIVE", ev.version); break;
+      case "MARKET_SETTLED":   setStatus(m, "SETTLED", ev.version); break;
       default: return false;
     }
     return true;
+  }
+
+  /** statusVersion = the version the status is known as of; reconcileStatus() compares against it. */
+  function setStatus(m, status, version, suspendReason = null) {
+    m.status = status;
+    m.statusVersion = version;
+    m.suspendReason = suspendReason;
   }
 
   // ---------------------------------------------------------------- snapshot
@@ -553,6 +568,7 @@
       if (local && local.version >= m.version) { skipped++; continue; }
       state.markets.set(m.marketId, {
         marketId: m.marketId, status: m.status, version: m.version,
+        statusVersion: m.version, suspendReason: m.suspendReason ?? null,
         lastUpdatedAt: m.lastUpdatedAt,
         odds: new Map((m.selections || []).map((s) => [s.selectionId, Number(s.odds)])),
       });
@@ -562,6 +578,46 @@
     log(`snapshot ${snap.status}: ${installed} market(s) installed`
         + (skipped ? `, ${skipped} already ahead via stream` : ""), "sys");
   }
+
+  /**
+   * The staleness sweep suspends a market by writing Redis directly: no Kafka event, so nothing on
+   * the stream, and the version does not move, so loadSnapshot()'s version guard would skip it too.
+   * Without this the page shows ACTIVE while bet-service answers MARKET_SUSPENDED.
+   *
+   * The snapshot's status is adopted only when the snapshot is not behind what the stream already
+   * told us: for a stale-feed suspension that means no newer price has arrived here (a newer price
+   * has already reopened it server-side); for anything else, no newer status event.
+   */
+  async function reconcileStatus() {
+    const eventId = state.event?.eventId;
+    if (!eventId || state.buffering) return;
+    let snap;
+    try {
+      const res = await fetch(`/api/v1/events/${encodeURIComponent(eventId)}`);
+      if (!res.ok) return;
+      snap = await res.json();
+    } catch (e) {
+      return;
+    }
+    if (state.event?.eventId !== eventId || state.buffering) return;
+
+    let changed = false;
+    for (const remote of snap.markets || []) {
+      const local = state.markets.get(remote.marketId);
+      if (!local) continue;
+      const reason = remote.suspendReason ?? null;
+      const notBehind = reason === "STALE_FEED"
+          ? remote.version >= local.version
+          : remote.version >= local.statusVersion;
+      if (!notBehind || (local.status === remote.status && local.suspendReason === reason)) continue;
+      setStatus(local, remote.status, remote.version, reason);
+      log(`${local.marketId} is ${remote.status}${reason ? ` (${reason})` : ""} in the snapshot `
+          + `— not sent on the stream`, "sys");
+      changed = true;
+    }
+    if (changed) render();
+  }
+  setInterval(reconcileStatus, 3000);
 
   // ---------------------------------------------------------------- render
   const prevOdds = new Map();
@@ -592,7 +648,8 @@
       head.className = "row";
       head.style.marginBottom = "4px";
       head.innerHTML = `<strong>${esc(m.marketId)}</strong>
-        <span class="pill ${String(m.status).toLowerCase()}">${esc(m.status)}</span>
+        <span class="pill ${String(m.status).toLowerCase()}">${esc(m.status)}${
+            m.suspendReason ? " · " + esc(m.suspendReason.toLowerCase().replace("_", " ")) : ""}</span>
         <span class="meta">v${m.version}${m.lastUpdatedAt ? " · " + esc(shortTime(m.lastUpdatedAt)) : ""}</span>`;
       box.appendChild(head);
 
@@ -675,6 +732,8 @@
         : `HTTP ${res.status} ${json.status}${json.currentOdds != null
             ? ` · current=${Number(json.currentOdds).toFixed(2)}` : ""}${json.reason ? ` · ${json.reason}` : ""}`;
       log(`POST /bets → ${res.status} ${json.status}`, accepted ? "applied" : "err");
+      // A rejection may be the first sign that Redis and this page disagree on the market status.
+      if (!accepted) reconcileStatus();
 
       if (accepted) {
         const already = state.openBets.some((b) => b.betId === json.betId);

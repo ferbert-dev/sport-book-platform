@@ -38,6 +38,6 @@ public class EventSnapshotService {
                 .toList();
 
         return new MarketSnapshot(market.marketId(), market.status(), market.version(),
-                market.lastUpdatedAt(), selections);
+                market.lastUpdatedAt(), market.suspendReason(), selections);
     }
 }
