@@ -126,10 +126,36 @@ public class ManualMatchDirector {
 
     public void suspend(ManualMatch match) {
         feed.emit(ProviderMessage.marketLock(match.eventId(), match.marketId()));
+        match.setMarketLocked(true);
     }
 
     public void open(ManualMatch match) {
         feed.emit(ProviderMessage.marketUnlock(match.eventId(), match.marketId()));
+        match.setMarketLocked(false);
+    }
+
+    /**
+     * The recovery snapshot a provider sends after it restarts: the current status of every market
+     * that is still in play, MARKET_UNLOCK or MARKET_LOCK. A consumer that suspended everything on
+     * the session change (it cannot know what the old session sent last) gets the authoritative
+     * status back from the provider itself, so open markets reopen without anyone stepping in.
+     *
+     * <p>Settled matches are skipped: their result was final in the old session.
+     *
+     * @return how many markets were announced
+     */
+    public int announceMarketStates() {
+        int announced = 0;
+        for (ManualMatch match : matches.values()) {
+            if (match.isSettled()) {
+                continue;
+            }
+            feed.emit(match.isMarketLocked()
+                    ? ProviderMessage.marketLock(match.eventId(), match.marketId())
+                    : ProviderMessage.marketUnlock(match.eventId(), match.marketId()));
+            announced++;
+        }
+        return announced;
     }
 
     /**
