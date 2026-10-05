@@ -59,7 +59,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Off on purpose: only kafka-init may create topics. With auto-creation on, a client that
+      # asks for a topic before kafka-init has run gets it created with the broker default of
+      # ONE partition, and kafka-init's --if-not-exists then leaves it that way.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
       interval: 10s
@@ -68,7 +71,8 @@ services:
       start_period: 20s
 
   # One-shot: create both topics with 3 partitions so partition-key ordering is
-  # observable. Auto-creation would yield a single partition.
+  # observable. It is the only thing that creates topics (broker auto-creation is off), so every
+  # Kafka client below waits for it to finish.
   kafka-init:
     image: apache/kafka:4.0.0
     container_name: sportsbook-kafka-init
@@ -195,6 +199,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       postgres:
@@ -219,6 +225,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     healthcheck:
@@ -263,6 +271,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       bet-service:
@@ -292,6 +302,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   # Dev-only stand-in for the external sports data provider (Sportradar, Betgenius...). It is
   # NOT part of the platform: it streams provider messages over WebSocket and serves the /dev
@@ -339,6 +351,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       state-processor:
         condition: service_healthy
       settlement-service:
