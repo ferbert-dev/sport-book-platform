@@ -20,7 +20,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -167,21 +166,24 @@ public class BetService {
      * Writes the bet and its outbox event in one transaction.
      *
      * <p>The unique constraint is the real guard against concurrent duplicate requests: two
-     * simultaneous retries can both pass the step-1 read, so one of them loses the insert race and
-     * is resolved by re-reading the winner's row.
+     * simultaneous retries can both pass the step-1 read, and exactly one of them inserts. The
+     * other sees "0 rows" from {@link BetRepository#insertIfAbsent} and returns the winner's bet,
+     * the same answer a sequential retry gets. It reads the winner in this same transaction, which
+     * is still valid because the conflict was never an error; under READ COMMITTED that read sees
+     * the row the winner has just committed.
      */
     private PlaceBetResponse persist(PlaceBetRequest request, BigDecimal acceptedOdds) {
         Bet bet = Bet.accept(request.userId(), request.eventId(), request.marketId(),
                 request.selectionId(), request.stake(), acceptedOdds, request.idempotencyKey());
-        try {
-            betRepository.saveAndFlush(bet);
-        } catch (DataIntegrityViolationException raceLost) {
+        if (betRepository.insertIfAbsent(bet) == 0) {
             duplicates.increment();
             log.info("DUPLICATE_BET_REQUEST_RACE userId={} idempotencyKey={}",
                     request.userId(), request.idempotencyKey());
             Bet winner = betRepository
                     .findByUserIdAndIdempotencyKey(request.userId(), request.idempotencyKey())
-                    .orElseThrow(() -> raceLost);
+                    .orElseThrow(() -> new IllegalStateException("Bet for user " + request.userId()
+                            + " and idempotency key " + request.idempotencyKey()
+                            + " conflicted on insert but cannot be read"));
             return PlaceBetResponse.accepted(winner.getId().toString(), winner.getAcceptedOdds());
         }
 

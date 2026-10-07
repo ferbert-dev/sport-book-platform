@@ -386,6 +386,56 @@ class PlaceBetIT {
         assertThat(onKafka.get(1)).contains("\"type\":\"BET_SETTLED\"");
     }
 
+    /**
+     * Two requests with the same idempotency key at the same time. Both pass the step-1 lookup
+     * (neither row is committed yet); the unique constraint lets one insert win. The loser must get
+     * the winner's bet back, exactly as a sequential retry does.
+     *
+     * <p>The winner is a stand-in transaction that inserts the bet row and stays open, so the real
+     * request deterministically blocks on the unique index and loses when the winner commits.
+     */
+    @Test
+    void concurrentRetryThatLosesTheInsertRaceGetsTheWinnersBetBack() throws Exception {
+        String idempotencyKey = "it-" + UUID.randomUUID();
+        UUID winnerId = UUID.randomUUID();
+        CountDownLatch winnerHasInserted = new CountDownLatch(1);
+        CountDownLatch loserHasBeenAttempted = new CountDownLatch(1);
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> winner = pool.submit(() -> transaction.executeWithoutResult(status -> {
+                jdbc.update("INSERT INTO bet (id, user_id, event_id, market_id, selection_id, stake, "
+                                + "accepted_odds, status, idempotency_key, created_at) "
+                                + "VALUES (?, 'user-42', ?, ?, ?, 100.00, 2.10, 'OPEN', ?, now())",
+                        winnerId, EVENT_ID, MARKET_ID, SELECTION, idempotencyKey);
+                winnerHasInserted.countDown();
+                awaitQuietly(loserHasBeenAttempted);
+            }));
+            assertThat(winnerHasInserted.await(10, TimeUnit.SECONDS)).isTrue();
+
+            Future<ResponseEntity<PlaceBetResponse>> loser = pool.submit(() -> restTemplate.postForEntity(
+                    "/api/v1/bets", request(idempotencyKey), PlaceBetResponse.class));
+            try {
+                loser.get(2, TimeUnit.SECONDS);
+            } catch (TimeoutException blockedOnTheUniqueIndex) {
+                // Expected: the insert waits for the winner's transaction to end.
+            }
+            loserHasBeenAttempted.countDown();
+            winner.get(10, TimeUnit.SECONDS);
+            ResponseEntity<PlaceBetResponse> response = loser.get(10, TimeUnit.SECONDS);
+
+            assertThat(response.getStatusCode())
+                    .as("the losing retry is a duplicate, not a server error")
+                    .isEqualTo(HttpStatus.CREATED);
+            assertThat(response.getBody()).isNotNull();
+            assertThat(response.getBody().betId()).isEqualTo(winnerId.toString());
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM bet WHERE user_id = 'user-42' "
+                    + "AND idempotency_key = ?", Long.class, idempotencyKey)).isEqualTo(1);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private long openBetsOn(String marketId) {
         Long open = jdbc.queryForObject(
                 "SELECT count(*) FROM bet WHERE market_id = ? AND status = 'OPEN'", Long.class, marketId);

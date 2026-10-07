@@ -51,8 +51,7 @@ class SettlementServiceTest {
     void setUp() {
         service = new SettlementService(betRepository, processedSettlements, outbox, json, "EUR",
                 new SimpleMeterRegistry());
-        when(processedSettlements.existsByMarketIdAndSettlementVersion(MARKET_ID, SETTLEMENT_VERSION))
-                .thenReturn(false);
+        when(processedSettlements.insertIfAbsent(any())).thenReturn(1);
     }
 
     /** Builds a Bet without going through bet-service; the entity has no public constructor. */
@@ -83,7 +82,7 @@ class SettlementServiceTest {
         // The order is the fix: a lock taken after the SELECT would protect nothing.
         var order = inOrder(processedSettlements, betRepository);
         order.verify(processedSettlements).lockForSettlement(MARKET_ID);
-        order.verify(processedSettlements).saveAndFlush(any());
+        order.verify(processedSettlements).insertIfAbsent(any());
         order.verify(betRepository).findByEventIdAndMarketIdAndStatus(EVENT_ID, MARKET_ID, BetStatus.OPEN);
     }
 
@@ -206,25 +205,14 @@ class SettlementServiceTest {
     }
 
     @Test
-    void alreadyProcessedSettlementIsSkippedEntirely() {
-        when(processedSettlements.existsByMarketIdAndSettlementVersion(MARKET_ID, SETTLEMENT_VERSION))
-                .thenReturn(true);
+    void aSettlementThatIsAlreadyRegisteredIsSkippedEntirely() {
+        // Zero rows from the fence insert: a redelivery, or a concurrent delivery that lost.
+        when(processedSettlements.insertIfAbsent(any())).thenReturn(0);
 
         boolean settled = service.settle(settledEvent());
 
         assertThat(settled).isFalse();
         verify(betRepository, never()).findByEventIdAndMarketIdAndStatus(any(), any(), any());
-        verify(outbox, never()).save(any());
-    }
-
-    @Test
-    void concurrentDeliveryLosingTheFenceInsertIsSkippedWithoutDuplicatePayouts() {
-        when(processedSettlements.saveAndFlush(any()))
-                .thenThrow(new DataIntegrityViolationException("uk_settlement_market_version"));
-
-        boolean settled = service.settle(settledEvent());
-
-        assertThat(settled).isFalse();
         verify(outbox, never()).save(any());
     }
 
@@ -235,7 +223,7 @@ class SettlementServiceTest {
         boolean settled = service.settle(settledEvent());
 
         assertThat(settled).isTrue();
-        verify(processedSettlements).saveAndFlush(any());
+        verify(processedSettlements).insertIfAbsent(any());
         verify(outbox, never()).save(any());
     }
 

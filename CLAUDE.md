@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 194 unit + 14 integration tests
+./mvnw clean verify                   # canonical build: compile + 201 unit + 17 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -142,10 +142,17 @@ guarantees correctness:
 
 - **Bets** — read `(userId, idempotencyKey)` first, *before any validation*, so a client retrying
   after a timeout is never re-judged against newer odds. Concurrent retries can both pass that
-  read; the loser catches `DataIntegrityViolationException` on `uk_bet_user_idempotency` and
-  resolves by re-reading the winner.
-- **Settlement** — register `(marketId, settlementVersion)` in `processed_settlements` first,
-  with the same read-then-insert-then-catch shape on `uk_settlement_market_version`.
+  read; `BetRepository.insertIfAbsent` (`INSERT … ON CONFLICT ON CONSTRAINT uk_bet_user_idempotency
+  DO NOTHING`) then inserts for exactly one of them, and the other gets "0 rows" and returns the
+  winner's bet.
+- **Settlement** — `ProcessedSettlementRepository.insertIfAbsent` registers
+  `(marketId, settlementVersion)` first, the same way on `uk_settlement_market_version`.
+
+**Never insert-and-catch a unique violation inside a transaction.** In PostgreSQL a failed
+statement aborts the transaction (`current transaction is aborted, commands ignored…`); catching
+the Java exception does not undo that, so the "re-read the winner" that follows fails and the
+caller gets a 500. A mock-based test cannot show this; `PlaceBetIT` does. `ON CONFLICT DO NOTHING`
+is not an error, and naming the constraint keeps every other violation loud.
 
 ### Bet placement and settlement are serialised per market
 

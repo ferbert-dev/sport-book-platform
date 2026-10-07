@@ -18,7 +18,6 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
-import org.springframework.dao.DataIntegrityViolationException;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -54,7 +53,7 @@ class BetServiceTest {
 
     // TODO(late-bet 8): add unit tests for the new rule (the mock returns false by default, so none
     //   of the existing tests exercises it):
-    //   - settled market -> outcome MARKET_SETTLED, and verify(betRepository, never()).saveAndFlush(any())
+    //   - settled market -> outcome MARKET_SETTLED, and verify(betRepository, never()).insertIfAbsent(any())
     //     and verify(outboxRepository, never()).save(any());
     //   - a retry with an existing idempotency key on a settled market still returns the original
     //     bet as ACCEPTED (the replay check runs first).
@@ -67,6 +66,7 @@ class BetServiceTest {
 		        properties, SportsbookJson.create(), clock, new SimpleMeterRegistry());
 
         when(betRepository.findByUserIdAndIdempotencyKey(any(), any())).thenReturn(Optional.empty());
+        when(betRepository.insertIfAbsent(any())).thenReturn(1);
     }
 
     private void marketIsBettable(BigDecimal odds) {
@@ -92,7 +92,7 @@ class BetServiceTest {
 
         assertThat(response.status()).isEqualTo(BetOutcome.STAKE_LIMIT_EXCEEDED);
         verifyNoInteractions(marketState);
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
         verify(outboxRepository, never()).save(any());
     }
 
@@ -137,7 +137,7 @@ class BetServiceTest {
         assertThat(response.status()).isEqualTo(BetOutcome.ACCEPTED);
         assertThat(response.betId()).isNotNull();
         assertThat(response.acceptedOdds()).isEqualByComparingTo("2.10");
-        verify(betRepository).saveAndFlush(any(Bet.class));
+        verify(betRepository).insertIfAbsent(any(Bet.class));
     }
 
     @Test
@@ -150,7 +150,7 @@ class BetServiceTest {
         var order = inOrder(processedSettlementRepository, betRepository);
         order.verify(processedSettlementRepository).lockForBetPlacement(MARKET);
         order.verify(processedSettlementRepository).existsByMarketId(MARKET);
-        order.verify(betRepository).saveAndFlush(any(Bet.class));
+        order.verify(betRepository).insertIfAbsent(any(Bet.class));
     }
 
     @Test
@@ -180,7 +180,7 @@ class BetServiceTest {
         PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
 
         assertThat(response.status()).isEqualTo(BetOutcome.MARKET_SUSPENDED);
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
         verify(outboxRepository, never()).save(any());
     }
 
@@ -191,7 +191,7 @@ class BetServiceTest {
         PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
 
         assertThat(response.status()).isEqualTo(BetOutcome.EVENT_NOT_LIVE);
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
     }
 
     @Test
@@ -211,7 +211,7 @@ class BetServiceTest {
         PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
 
         assertThat(response.status()).isEqualTo(BetOutcome.STALE_MARKET_DATA);
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
     }
 
     @Test
@@ -232,7 +232,7 @@ class BetServiceTest {
 
         assertThat(response.status()).isEqualTo(BetOutcome.ODDS_CHANGED);
         assertThat(response.currentOdds()).isEqualByComparingTo("1.95");
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
     }
 
     @Test
@@ -265,7 +265,7 @@ class BetServiceTest {
 
         assertThat(response.status()).isEqualTo(BetOutcome.ACCEPTED);
         assertThat(response.betId()).isEqualTo(existing.getId().toString());
-        verify(betRepository, never()).saveAndFlush(any());
+        verify(betRepository, never()).insertIfAbsent(any());
         verify(outboxRepository, never()).save(any());
     }
 
@@ -289,8 +289,9 @@ class BetServiceTest {
         marketIsBettable(new BigDecimal("2.10"));
         Bet winner = Bet.accept(USER, EVENT, MARKET, SELECTION,
                 new BigDecimal("100.00"), new BigDecimal("2.10"), "key-1");
-        when(betRepository.saveAndFlush(any(Bet.class)))
-                .thenThrow(new DataIntegrityViolationException("uk_bet_user_idempotency"));
+        // Zero rows: another request with this key inserted first. No exception is involved, which
+        // is the point; PlaceBetIT runs the same race against real PostgreSQL.
+        when(betRepository.insertIfAbsent(any(Bet.class))).thenReturn(0);
         when(betRepository.findByUserIdAndIdempotencyKey(USER, "key-1"))
                 .thenReturn(Optional.empty())
                 .thenReturn(Optional.of(winner));
@@ -309,7 +310,7 @@ class BetServiceTest {
         service.placeBet(request("2.10", "key-1"));
 
         ArgumentCaptor<Bet> captor = ArgumentCaptor.forClass(Bet.class);
-        verify(betRepository).saveAndFlush(captor.capture());
+        verify(betRepository).insertIfAbsent(captor.capture());
         Bet saved = captor.getValue();
         assertThat(saved.getStatus()).isEqualTo(com.example.sportsbook.common.BetStatus.OPEN);
         assertThat(saved.getAcceptedOdds()).isEqualByComparingTo("2.10");

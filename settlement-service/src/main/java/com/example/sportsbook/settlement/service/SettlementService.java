@@ -17,7 +17,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -108,19 +107,14 @@ public class SettlementService {
         return true;
     }
 
-    /** @return true if this settlement is new, false if already processed */
+    /**
+     * The idempotency fence: one row per (market, settlement version), and the unique constraint
+     * decides who gets it. A redelivered MARKET_SETTLED finds the row and inserts nothing.
+     *
+     * @return true if this delivery registered the settlement, false if it was already processed
+     */
     private boolean registerSettlement(String marketId, long settlementVersion) {
-        if (processedSettlements.existsByMarketIdAndSettlementVersion(marketId, settlementVersion)) {
-            return false;
-        }
-        try {
-            // The unique constraint, not the read above, is the real fence: two concurrent
-            // deliveries can both pass the read, and exactly one wins this insert.
-            processedSettlements.saveAndFlush(ProcessedSettlement.of(marketId, settlementVersion));
-            return true;
-        } catch (DataIntegrityViolationException alreadyProcessed) {
-            return false;
-        }
+        return processedSettlements.insertIfAbsent(ProcessedSettlement.of(marketId, settlementVersion)) == 1;
     }
 
     private boolean settleOne(Bet bet, String winningSelectionId, long settlementVersion) {

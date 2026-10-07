@@ -18,6 +18,7 @@ and still open are listed at the end.
 | 6 | Settlement could publish a payout for a bet it then failed to settle | Settlement writes its events to the transactional outbox | `0e1c158` |
 | 7 | One bad record could stall settlement for a whole partition | Data errors are not retried; the record is abandoned | `3a062b1` |
 | 8 | A bet could be accepted whose payout could not be stored | Stake limited in two layers | `6984419` |
+| 9 | The loser of a concurrent idempotency-key race got HTTP 500 | Conflict-safe insert instead of insert-and-catch | branch `changes` |
 
 ---
 
@@ -170,13 +171,35 @@ fence row; it can be settled by replaying the record once the cause is fixed.
 
 `BetServiceProperties` refuses to start with a limit of zero or less, or of 10⁹ or more.
 
+## 9. The loser of a concurrent idempotency-key race got HTTP 500
+
+**Problem.** Two requests with the same idempotency key at the same time both pass the lookup, and
+the unique constraint lets one insert win. The loser caught the `DataIntegrityViolationException`
+and re-read the winner in the same transaction. In PostgreSQL a failed statement aborts the
+transaction (`current transaction is aborted, commands ignored until end of transaction block`), so
+that read failed too and the client got a 500 instead of its bet. No second bet was ever created;
+the damage was the wrong answer, at exactly the moment the key exists for: a retry after a timeout.
+
+The unit test for this path was green all along. It ran on mocks, and a mock does not know the
+database transaction is dead.
+
+**Fix.** `BetRepository.insertIfAbsent`: `INSERT … ON CONFLICT ON CONSTRAINT
+uk_bet_user_idempotency DO NOTHING`. It waits for the competing insert, then reports zero rows. That
+is not an error, so the transaction stays usable and the winner is read in it (under `READ
+COMMITTED` the read sees the row the winner just committed). The constraint is named, so any other
+violation still fails loudly rather than being mistaken for a duplicate. The settlement fence uses
+the same statement on `uk_settlement_market_version`.
+
+**Verified by.** `PlaceBetIT`: a stand-in winner holds its insert open, the real request blocks on
+the unique index, loses, and answers 201 with the winner's bet id. `SettlementIT`: a redelivered
+settlement registers nothing.
+
 ---
 
 ## Known and still open
 
 | Problem | Effect | Direction |
 | --- | --- | --- |
-| The loser of a concurrent idempotency-key race re-reads inside an aborted transaction | It gets HTTP 500 instead of the winner's bet; data stays correct. A failing test exists and is not committed | `INSERT … ON CONFLICT DO NOTHING`, or resolve in a new transaction |
 | Market ownership is not checked | A bet with a live event id and another event's market is accepted and never settled | Compare the market's stored event id |
 | The outbox relay is a single poller | A second instance would send every row twice | Claim rows with `FOR UPDATE SKIP LOCKED`, or CDC |
 | `StalenessDetector` reads status and then writes it | It can overwrite `SETTLED` | One atomic conditional write |

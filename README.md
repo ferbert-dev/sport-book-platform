@@ -393,9 +393,12 @@ Two mechanisms, because one is not enough:
 1. **Read first.** If a bet already exists for `(userId, idempotencyKey)`, return it immediately.
    This happens *before* any validation — deliberately. A client retrying after a network timeout
    already holds that bet; re-validating against newer odds could reject a bet it legitimately has.
-2. **Unique constraint.** Two simultaneous retries can both pass step 1. One loses the insert race
-   and gets a `DataIntegrityViolationException`, which is resolved by re-reading the winner's row
-   and returning that. The database, not the application, is the real fence.
+2. **Unique constraint.** Two simultaneous retries can both pass step 1. The insert is
+   `INSERT … ON CONFLICT ON CONSTRAINT uk_bet_user_idempotency DO NOTHING`: it inserts for exactly
+   one of them, and the other gets "0 rows" and returns the winner's bet. The database, not the
+   application, is the real fence. (Inserting and catching the unique violation does not work on
+   PostgreSQL: the failed statement aborts the transaction, so the winner can no longer be read in
+   it and the loser gets a 500.)
 
 ### Rejection outcomes
 
@@ -423,9 +426,9 @@ processed_settlements(id, market_id, settlement_version, processed_at)
 UNIQUE (market_id, settlement_version)
 ```
 
-Settlement registers itself in that table **first**. A redelivery collides with the unique
-constraint and is skipped. As with bets, the read-then-insert pattern uses the constraint as the
-real fence, so two concurrent deliveries cannot both proceed.
+Settlement registers itself in that table **first**, with `INSERT … ON CONFLICT DO NOTHING`. A
+redelivery inserts nothing and is skipped. As with bets, the constraint is the real fence, so two
+concurrent deliveries cannot both proceed.
 
 Payout events additionally carry a **deterministic** id:
 
@@ -858,7 +861,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-208 tests: 194 unit tests (JUnit 5, AssertJ, Mockito) plus 14 Testcontainers integration tests.
+218 tests: 201 unit tests (JUnit 5, AssertJ, Mockito) plus 17 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |
