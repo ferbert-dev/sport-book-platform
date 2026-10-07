@@ -9,6 +9,10 @@ import java.util.UUID;
 
 public interface OutboxRepository extends JpaRepository<OutboxEvent, UUID> {
 
-    /** Oldest-first so events are published in the order they were produced. */
-    List<OutboxEvent> findByPublishedAtIsNullOrderByCreatedAtAsc(Limit limit);
+    /**
+     * In insert order, by the database-assigned {@code seq}. Not by {@code createdAt}: two services
+     * write this table, each with its own clock, and a skew between them reordered a bet's
+     * BET_SETTLED ahead of its BET_PLACED.
+     */
+    List<OutboxEvent> findByPublishedAtIsNullOrderBySeqAsc(Limit limit);
 }

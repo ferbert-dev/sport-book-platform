@@ -325,6 +325,34 @@ class PlaceBetIT {
         }
     }
 
+    /**
+     * settlement-service does not send to Kafka: it inserts BET_SETTLED / PAYOUT_REQUIRED rows into
+     * this service's outbox table, in its own settlement transaction. This relay is what delivers
+     * them, on the same key and after the bet's own BET_PLACED.
+     *
+     * <p>The row below is stamped by the database clock, the bet's own row by this JVM's: two
+     * clocks, as with two services. Ordering the relay by created_at sent BET_SETTLED first here;
+     * that is why it orders by the database-assigned seq.
+     */
+    @Test
+    void rowsQueuedBySettlementAreRelayedOnTheBetsKeyAfterItsBetPlaced() {
+        PlaceBetResponse placed = restTemplate.postForEntity("/api/v1/bets",
+                request("it-" + UUID.randomUUID()), PlaceBetResponse.class).getBody();
+        assertThat(placed).isNotNull();
+        String betId = placed.betId();
+
+        // What SettlementService.enqueue writes.
+        jdbc.update("INSERT INTO outbox_event (id, aggregate_type, aggregate_id, event_type, payload, created_at) "
+                        + "VALUES (?, 'BET', ?, 'BET_SETTLED', ?, now())", UUID.randomUUID(), betId,
+                "{\"type\":\"BET_SETTLED\",\"betId\":\"" + betId + "\",\"status\":\"WON\"}");
+
+        List<String> onKafka = awaitBetEvents(betId, 2);
+
+        assertThat(onKafka).hasSize(2);
+        assertThat(onKafka.get(0)).contains("\"type\":\"BET_PLACED\"");
+        assertThat(onKafka.get(1)).contains("\"type\":\"BET_SETTLED\"");
+    }
+
     private long openBetsOn(String marketId) {
         Long open = jdbc.queryForObject(
                 "SELECT count(*) FROM bet WHERE market_id = ? AND status = 'OPEN'", Long.class, marketId);
@@ -341,6 +369,11 @@ class PlaceBetIT {
 
     /** Reads bet-events from the beginning looking for this bet's BET_PLACED payload. */
     private String awaitBetEvent(String betId) {
+        return awaitBetEvents(betId, 1).getFirst();
+    }
+
+    /** This bet's payloads on bet-events, in partition order, once at least {@code expected} arrived. */
+    private List<String> awaitBetEvents(String betId, int expected) {
         Properties props = new Properties();
         props.put("bootstrap.servers", KAFKA.getBootstrapServers());
         props.put("group.id", "it-verifier-" + UUID.randomUUID());
@@ -348,19 +381,24 @@ class PlaceBetIT {
         props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
 
+        List<String> payloads = new java.util.ArrayList<>();
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
             consumer.subscribe(List.of("bet-events"));
             Instant deadline = Instant.now().plus(Duration.ofSeconds(45));
-            while (Instant.now().isBefore(deadline)) {
+            while (Instant.now().isBefore(deadline) && payloads.size() < expected) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
                 for (ConsumerRecord<String, String> record : records) {
                     if (betId.equals(record.key())) {
-                        return record.value();
+                        payloads.add(record.value());
                     }
                 }
             }
         }
-        throw new AssertionError("No BET_PLACED on bet-events for bet " + betId);
+        if (payloads.size() < expected) {
+            throw new AssertionError("Expected " + expected + " event(s) on bet-events for bet " + betId
+                    + ", got " + payloads);
+        }
+        return payloads;
     }
 
     private void sleep(long millis) {

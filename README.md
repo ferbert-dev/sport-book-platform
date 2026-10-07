@@ -354,7 +354,23 @@ COMMIT                     -- both, or neither
 ```
 
 `OutboxPublisher` then polls unpublished rows oldest-first, sends to `bet-events`, and marks them
-published. Three details matter:
+published.
+
+Settlement uses the same outbox, for the mirror-image reason. It used to send `BET_SETTLED` and
+`PAYOUT_REQUIRED` from inside its database transaction, which has its own failure:
+
+```
+BEGIN
+  settle bets (in memory)
+  publish Kafka    <-- PAYOUT_REQUIRED is out
+COMMIT             <-- fails: the bet is still OPEN, the payout is already public
+```
+
+Now `SettlementService` inserts those events into `outbox_event` together with the bet rows and the
+fence row, and has no Kafka producer at all. There is one table and one relay (bet-service's), so a
+bet's `BET_PLACED` is sent before its `BET_SETTLED`. The relay orders by `seq`, an identity column
+the database assigns: `created_at` is stamped by each writer's own clock and reordered those two
+events when the clocks differed. Details that matter:
 
 - The Kafka send is **synchronous** — the row is only marked published after the broker acks.
 - On failure the publisher **stops at the first failed row** rather than skipping ahead, so
@@ -518,7 +534,8 @@ deterministic `paymentId` is the contract between them.
 | Kafka → Redis | Eventually consistent | Redis lags the log by milliseconds |
 | Redis → bet validation | Read of a lagging projection | A bet can be validated against odds that just changed |
 | Bet + outbox | **Atomic** (one transaction) | An accepted bet always has its event |
-| Outbox → Kafka | At-least-once | `BET_PLACED` may be published twice |
+| Outbox → Kafka | At-least-once | Any bet event may be published twice |
+| Settlement + its events | **Atomic** (one transaction, via the outbox) | No payout event without a committed settlement |
 | Settlement | Exactly-once *effect*, at-least-once delivery | Fence table prevents double payouts |
 
 The honest summary: **the only strong consistency in the system is inside a single PostgreSQL
@@ -840,7 +857,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-201 tests: 192 unit tests (JUnit 5, AssertJ, Mockito) plus 9 Testcontainers integration tests.
+208 tests: 194 unit tests (JUnit 5, AssertJ, Mockito) plus 14 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |
@@ -858,9 +875,13 @@ Integration tests:
 - **`SportsEventProjectionIT`** — Kafka → state-processor → Redis, including that an older version
   does not rewind the projection.
 - **`PlaceBetIT`** — `POST /bets` → Postgres bet row → outbox row → `BET_PLACED` on `bet-events`,
-  plus idempotent retry and rejection. Runs the real Flyway migration.
+  plus idempotent retry and rejection. Runs the real Flyway migration. Also the late-bet races
+  against a settlement, and that outbox rows written by settlement are relayed after `BET_PLACED`.
+- **`SettlementIT`** — `SettlementService` on real PostgreSQL: bets, fence and outbox rows commit
+  together; a settlement that fails in the database leaves no queued event; a settlement waits for
+  a bet that still holds the market lock.
 
-Both are annotated `@Testcontainers(disabledWithoutDocker = true)`, so `./mvnw clean verify`
+All are annotated `@Testcontainers(disabledWithoutDocker = true)`, so `./mvnw clean verify`
 succeeds with or without a Docker daemon — it simply skips them when Docker is absent.
 
 > **Docker Engine 29 note.** Docker 29 raised its minimum API version to 1.40, while the
@@ -884,7 +905,8 @@ Honest list. None of these are hidden behind optimistic wording.
 3. **The outbox publisher is a single poller.** Two `bet-service` instances would both poll and
    could publish the same row twice. Consumers are idempotent so this is safe, but
    `SELECT … FOR UPDATE SKIP LOCKED` would make it cleaner, and CDC (Debezium) would remove the
-   polling entirely.
+   polling entirely. It is also the only relay for settlement's events, so `BET_SETTLED` and
+   `PAYOUT_REQUIRED` are delivered only while bet-service runs.
 4. **Provider recovery is replay-only.** A reconnecting or restarted worker resumes from a cursor
    (`?fromSequence=`) and the provider replays from a bounded window. A disconnect longer than that
    window still leaves a gap, and `requestProviderSnapshot(...)` only logs: real recovery for that

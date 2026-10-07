@@ -5,10 +5,13 @@ import com.example.sportsbook.common.BetSettledEvent;
 import com.example.sportsbook.common.BetStatus;
 import com.example.sportsbook.common.MarketSettledEvent;
 import com.example.sportsbook.common.PayoutRequiredEvent;
+import com.example.sportsbook.common.SportsbookJson;
 import com.example.sportsbook.settlement.domain.Bet;
-import com.example.sportsbook.settlement.messaging.BetEventPublisher;
+import com.example.sportsbook.settlement.domain.OutboxEvent;
 import com.example.sportsbook.settlement.repository.BetRepository;
+import com.example.sportsbook.settlement.repository.OutboxRepository;
 import com.example.sportsbook.settlement.repository.ProcessedSettlementRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -22,6 +25,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -39,13 +43,13 @@ class SettlementServiceTest {
     private final BetRepository betRepository = mock(BetRepository.class);
     private final ProcessedSettlementRepository processedSettlements =
             mock(ProcessedSettlementRepository.class);
-    private final BetEventPublisher publisher = mock(BetEventPublisher.class);
-
+    private final OutboxRepository outbox = mock(OutboxRepository.class);
+    private final ObjectMapper json = SportsbookJson.create();
     private SettlementService service;
 
     @BeforeEach
     void setUp() {
-        service = new SettlementService(betRepository, processedSettlements, publisher, "EUR",
+        service = new SettlementService(betRepository, processedSettlements, outbox, json, "EUR",
                 new SimpleMeterRegistry());
         when(processedSettlements.existsByMarketIdAndSettlementVersion(MARKET_ID, SETTLEMENT_VERSION))
                 .thenReturn(false);
@@ -81,6 +85,44 @@ class SettlementServiceTest {
         order.verify(processedSettlements).lockForSettlement(MARKET_ID);
         order.verify(processedSettlements).saveAndFlush(any());
         order.verify(betRepository).findByEventIdAndMarketIdAndStatus(EVENT_ID, MARKET_ID, BetStatus.OPEN);
+    }
+
+    /**
+     * The dual-write fix. Events are queued in the outbox, in the settlement's own transaction, and
+     * nothing is sent from here (this service has no Kafka dependency left to send with). So when
+     * the database write fails, the exception rolls back the queued rows together with the bets:
+     * no BET_SETTLED or PAYOUT_REQUIRED can exist for a bet the database never settled.
+     * SettlementIT proves the rollback against real Postgres.
+     */
+    @Test
+    void eventsAreOnlyQueuedSoAFailedDatabaseWritePropagatesAndTakesThemWithIt() {
+        Bet winning = bet(WINNER, "100.00", "2.10");
+        openBets(winning);
+        when(betRepository.saveAll(any()))
+                .thenThrow(new DataIntegrityViolationException("numeric field overflow"));
+
+        assertThatThrownBy(() -> service.settle(settledEvent()))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        assertThat(queuedRows()).allSatisfy(row -> assertThat(row.getAggregateId())
+                .isEqualTo(winning.getId().toString()));
+    }
+
+    @Test
+    void queuedRowsCarryTheBetIdAsKeyAndTheEventTypeTheRelayPublishes() {
+        Bet winning = bet(WINNER, "100.00", "2.10");
+        openBets(winning);
+
+        service.settle(settledEvent());
+
+        // The relay sends aggregateId as the Kafka key: it must be the bet id, or the events of one
+        // bet would no longer share a partition.
+        assertThat(queuedRows()).extracting(OutboxEvent::getAggregateId)
+                .containsOnly(winning.getId().toString());
+        assertThat(queuedRows()).extracting(OutboxEvent::getEventType)
+                .containsExactly("BET_SETTLED", "PAYOUT_REQUIRED");
+        assertThat(queuedRows()).extracting(OutboxEvent::getAggregateType).containsOnly("BET");
+        assertThat(queuedRows().getFirst().getPayload()).contains("\"type\":\"BET_SETTLED\"");
     }
 
     private void openBets(Bet... bets) {
@@ -128,7 +170,7 @@ class SettlementServiceTest {
 
         service.settle(settledEvent());
 
-        assertThat(publishedEvents()).filteredOn(BetSettledEvent.class::isInstance).hasSize(2);
+        assertThat(queuedEvents()).filteredOn(BetSettledEvent.class::isInstance).hasSize(2);
     }
 
     @Test
@@ -137,7 +179,7 @@ class SettlementServiceTest {
 
         service.settle(settledEvent());
 
-        List<PayoutRequiredEvent> payouts = publishedEvents().stream()
+        List<PayoutRequiredEvent> payouts = queuedEvents().stream()
                 .filter(PayoutRequiredEvent.class::isInstance)
                 .map(PayoutRequiredEvent.class::cast)
                 .toList();
@@ -154,7 +196,7 @@ class SettlementServiceTest {
 
         service.settle(settledEvent());
 
-        PayoutRequiredEvent payout = publishedEvents().stream()
+        PayoutRequiredEvent payout = queuedEvents().stream()
                 .filter(PayoutRequiredEvent.class::isInstance)
                 .map(PayoutRequiredEvent.class::cast)
                 .findFirst().orElseThrow();
@@ -172,7 +214,7 @@ class SettlementServiceTest {
 
         assertThat(settled).isFalse();
         verify(betRepository, never()).findByEventIdAndMarketIdAndStatus(any(), any(), any());
-        verify(publisher, never()).publish(any());
+        verify(outbox, never()).save(any());
     }
 
     @Test
@@ -183,7 +225,7 @@ class SettlementServiceTest {
         boolean settled = service.settle(settledEvent());
 
         assertThat(settled).isFalse();
-        verify(publisher, never()).publish(any());
+        verify(outbox, never()).save(any());
     }
 
     @Test
@@ -194,12 +236,23 @@ class SettlementServiceTest {
 
         assertThat(settled).isTrue();
         verify(processedSettlements).saveAndFlush(any());
-        verify(publisher, never()).publish(any());
+        verify(outbox, never()).save(any());
     }
 
-    private List<BetEvent> publishedEvents() {
-        ArgumentCaptor<BetEvent> captor = ArgumentCaptor.forClass(BetEvent.class);
-        verify(publisher, org.mockito.Mockito.atLeastOnce()).publish(captor.capture());
+    private List<OutboxEvent> queuedRows() {
+        ArgumentCaptor<OutboxEvent> captor = ArgumentCaptor.forClass(OutboxEvent.class);
+        verify(outbox, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
         return captor.getAllValues();
+    }
+
+    /** The queued payloads read back the way a consumer of bet-events would read them. */
+    private List<BetEvent> queuedEvents() {
+        return queuedRows().stream().map(row -> {
+            try {
+                return json.readValue(row.getPayload(), BetEvent.class);
+            } catch (Exception unreadable) {
+                throw new AssertionError("outbox payload is not a BetEvent: " + row.getPayload(), unreadable);
+            }
+        }).toList();
     }
 }

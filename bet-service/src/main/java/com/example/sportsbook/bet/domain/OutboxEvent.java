@@ -39,6 +39,10 @@ public class OutboxEvent {
     @Column(name = "published_at")
     private Instant publishedAt;
 
+    /** Relay order, assigned by the database on insert (identity column); never written from here. */
+    @Column(name = "seq", insertable = false, updatable = false)
+    private Long seq;
+
     protected OutboxEvent() {
         // for JPA
     }

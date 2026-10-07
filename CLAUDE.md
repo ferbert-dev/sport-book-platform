@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 192 unit + 9 integration tests
+./mvnw clean verify                   # canonical build: compile + 194 unit + 14 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -159,10 +159,23 @@ The order of those calls is the fix, and the key expression (`hashtextextended(:
 be identical in both repositories. The check relies on `READ COMMITTED`. A Redis check is never a
 substitute: it happens before the insert and outside the transaction.
 
-`settlement-service` publishes to Kafka **inside** the transaction on purpose. If the broker is
-down, the transaction rolls back and Kafka redelivers `MARKET_SETTLED`. Publishing after commit
-would leave the fence row committed, so the retry would be skipped as a duplicate and
-`BET_SETTLED` would be lost permanently. Do not "fix" this by moving the publish out.
+### Nothing is sent to Kafka from inside a business transaction
+
+Both writers use the transactional outbox, and there is **one** table and **one** relay:
+
+- `BetService` inserts `BET_PLACED` into `outbox_event` with the bet; `SettlementService` inserts
+  `BET_SETTLED` and `PAYOUT_REQUIRED` there with the bet rows and the fence row. Neither sends.
+- `OutboxPublisher` in bet-service is the only relay. It does not look at the event type, takes rows
+  in `seq` order (a database identity column, V2 migration) and sends them keyed by bet id.
+  `created_at` must not be used for ordering: each writer stamps it with its own clock, and a skew
+  between them sent a bet's `BET_SETTLED` before its `BET_PLACED`.
+- settlement-service has no Kafka producer at all. Do not add one: sending inside the transaction
+  can leave a payout in Kafka for a bet the database then failed to settle (the commit fails after
+  the send), and sending after the commit can lose the event for good (the fence skips the retry).
+- Do not add a second relay for the same table: without row claiming both would send every row.
+- A failing `MARKET_SETTLED` is retried with backoff until it succeeds
+  (`SettlementConfig.settlementErrorHandler`); the Spring Kafka default would skip it after ten
+  immediate attempts.
 
 ### Adding a domain event
 
@@ -181,7 +194,9 @@ is never serialized and the discriminator silently vanishes.
 (`spring.flyway.enabled: false`). One migration history, no race between two services.
 
 Both services map the `bet` table — a deliberate simplification documented in the README's
-limitations, not a pattern to extend.
+limitations, not a pattern to extend. The same shortcut covers `processed_settlements`
+(settlement writes it, bet-service reads it to refuse late bets) and `outbox_event` (both insert,
+bet-service relays).
 
 ## Build configuration that is load-bearing
 

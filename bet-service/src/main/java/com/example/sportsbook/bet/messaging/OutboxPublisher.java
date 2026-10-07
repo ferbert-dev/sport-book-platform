@@ -23,6 +23,13 @@ import java.util.List;
  * exactly-once, and nothing in the system claims it is.
  *
  * <p>Events are keyed by {@code aggregateId} (the bet id) so all events for one bet stay ordered.
+ *
+ * <p>This is the only relay for the table, and it does not look at the event type: besides this
+ * service's BET_PLACED it also sends the BET_SETTLED and PAYOUT_REQUIRED rows that
+ * settlement-service inserts. One table and one relay give one ordered queue, so a bet's BET_PLACED
+ * goes out before its BET_SETTLED. Rows are taken in {@code seq} order, which the database assigns:
+ * {@code created_at} comes from each writer's own clock and cannot order rows across services.
+ * The price of one relay is that settlement's events are delivered only while bet-service runs.
  */
 @Component
 public class OutboxPublisher {
@@ -51,7 +58,7 @@ public class OutboxPublisher {
     @Transactional
     public void publishPending() {
         List<OutboxEvent> pending =
-                outboxRepository.findByPublishedAtIsNullOrderByCreatedAtAsc(Limit.of(BATCH_SIZE));
+                outboxRepository.findByPublishedAtIsNullOrderBySeqAsc(Limit.of(BATCH_SIZE));
         if (pending.isEmpty()) {
             return;
         }
