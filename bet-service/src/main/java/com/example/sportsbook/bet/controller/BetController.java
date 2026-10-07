@@ -23,15 +23,25 @@ public class BetController {
     }
 
     /**
-     * Rejections return 422 rather than 400: the request was well-formed, but the market moved.
-     * The body always carries the machine-readable {@link BetOutcome}.
+     * The body always carries the machine-readable {@link BetOutcome}; the status says whether a
+     * retry can ever help.
+     *
+     * <ul>
+     *   <li>422 for a well-formed request the world is not ready for (market suspended or settled,
+     *       odds moved, stale data, stake limit): it may succeed later, or with other values.</li>
+     *   <li>400 for {@code INVALID_REQUEST}: the ids in the request do not fit together (unknown
+     *       selection, a market of another event). It can never succeed as sent.</li>
+     * </ul>
      */
     @PostMapping
     public ResponseEntity<PlaceBetResponse> placeBet(@Valid @RequestBody PlaceBetRequest request) {
         PlaceBetResponse response = betService.placeBet(request);
-        HttpStatus status = response.status() == BetOutcome.ACCEPTED
-                ? HttpStatus.CREATED
-                : HttpStatus.UNPROCESSABLE_ENTITY;
+        HttpStatus status = switch (response.status()) {
+            case ACCEPTED -> HttpStatus.CREATED;
+            case INVALID_REQUEST -> HttpStatus.BAD_REQUEST;
+            case ODDS_CHANGED, MARKET_SUSPENDED, EVENT_NOT_LIVE, STALE_MARKET_DATA,
+                 STAKE_LIMIT_EXCEEDED, MARKET_SETTLED -> HttpStatus.UNPROCESSABLE_ENTITY;
+        };
         return ResponseEntity.status(status).body(response);
     }
 }

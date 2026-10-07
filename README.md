@@ -411,9 +411,10 @@ Two mechanisms, because one is not enough:
 | `STALE_MARKET_DATA` | 422 | Market state older than the freshness threshold |
 | `MARKET_SETTLED` | 422 | Settlement has already processed the market; Redis had not caught up yet |
 | `STAKE_LIMIT_EXCEEDED` | 422 | Stake above `sportsbook.bet.max-stake` (default 10000) |
-| `INVALID_REQUEST` | 400 | Validation failure (including a stake with more than 8 integer digits) or unknown selection |
+| `INVALID_REQUEST` | 400 | Validation failure (including a stake with more than 8 integer digits), unknown selection, or a market that does not belong to the event |
 
-422 rather than 400 for market conditions: the request was well-formed, the world moved.
+422 rather than 400 for market conditions: the request was well-formed, the world moved, and it may
+succeed later or with other values. 400 means the request can never succeed as sent.
 
 ---
 
@@ -861,7 +862,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-218 tests: 201 unit tests (JUnit 5, AssertJ, Mockito) plus 17 Testcontainers integration tests.
+223 tests: 204 unit tests (JUnit 5, AssertJ, Mockito) plus 19 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |

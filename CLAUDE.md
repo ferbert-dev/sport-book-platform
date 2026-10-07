@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 201 unit + 17 integration tests
+./mvnw clean verify                   # canonical build: compile + 204 unit + 19 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -153,6 +153,13 @@ statement aborts the transaction (`current transaction is aborted, commands igno
 the Java exception does not undo that, so the "re-read the winner" that follows fails and the
 caller gets a 500. A mock-based test cannot show this; `PlaceBetIT` does. `ON CONFLICT DO NOTHING`
 is not an error, and naming the constraint keeps every other violation loud.
+
+**A bet's market must belong to its event.** `BetService` compares the request's `eventId` with the
+event id stored on the market in Redis and rejects a mismatch with `INVALID_REQUEST` (400).
+Settlement selects bets by event id *and* market id, so a mismatched bet would never be settled.
+`BetController` maps `INVALID_REQUEST` to 400 (can never succeed as sent) and every other rejection
+to 422 (may succeed later or with other values); its `switch` is exhaustive on purpose, so a new
+`BetOutcome` has to be given a status.
 
 ### Bet placement and settlement are serialised per market
 

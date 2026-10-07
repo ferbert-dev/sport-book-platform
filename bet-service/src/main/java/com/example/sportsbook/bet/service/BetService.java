@@ -114,6 +114,16 @@ public class BetService {
         if (market == null) {
             return reject(request, BetOutcome.MARKET_SUSPENDED, "Market has no current state");
         }
+        // The market must belong to the event the request names. Each id is valid on its own, but
+        // a bet stored under event A with a market of event B is selected by no settlement
+        // (settlement queries by event id AND market id) and would stay OPEN forever; and naming any
+        // live event would get a bet past step 2 on the market of an event that has finished.
+        // Before the status check: a wrong pair is the client's mistake whatever the status is, and
+        // must not be answered with MARKET_SUSPENDED ("try again later"). A market with no event id
+        // belongs to nothing.
+        if (!request.eventId().equals(market.eventId())) {
+            return reject(request, BetOutcome.INVALID_REQUEST, "Market does not belong to event");
+        }
         if (market.status() != MarketStatus.ACTIVE) {
             return reject(request, BetOutcome.MARKET_SUSPENDED, "Market status is " + market.status());
         }

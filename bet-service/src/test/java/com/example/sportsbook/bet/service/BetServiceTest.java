@@ -72,7 +72,7 @@ class BetServiceTest {
     private void marketIsBettable(BigDecimal odds) {
         when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
         when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
-                new MarketStateReader.MarketState(MARKET, MarketStatus.ACTIVE, now.minusSeconds(1))));
+                new MarketStateReader.MarketState(MARKET, EVENT, MarketStatus.ACTIVE, now.minusSeconds(1))));
         when(marketState.findOdds(MARKET, SELECTION)).thenReturn(Optional.of(odds));
     }
 
@@ -175,7 +175,7 @@ class BetServiceTest {
     void suspendedMarketIsRejected() {
         when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
         when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
-                new MarketStateReader.MarketState(MARKET, MarketStatus.SUSPENDED, now)));
+                new MarketStateReader.MarketState(MARKET, EVENT, MarketStatus.SUSPENDED, now)));
 
         PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
 
@@ -206,7 +206,7 @@ class BetServiceTest {
     void staleMarketDataIsRejectedSoADeadFeedCannotKeepTakingBets() {
         when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
         when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
-                new MarketStateReader.MarketState(MARKET, MarketStatus.ACTIVE, now.minusSeconds(31))));
+                new MarketStateReader.MarketState(MARKET, EVENT, MarketStatus.ACTIVE, now.minusSeconds(31))));
 
         PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
 
@@ -218,7 +218,7 @@ class BetServiceTest {
     void marketExactlyAtTheFreshnessBoundaryIsStillAccepted() {
         when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
         when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
-                new MarketStateReader.MarketState(MARKET, MarketStatus.ACTIVE, now.minusSeconds(30))));
+                new MarketStateReader.MarketState(MARKET, EVENT, MarketStatus.ACTIVE, now.minusSeconds(30))));
         when(marketState.findOdds(MARKET, SELECTION)).thenReturn(Optional.of(new BigDecimal("2.10")));
 
         assertThat(service.placeBet(request("2.10", "key-1")).status()).isEqualTo(BetOutcome.ACCEPTED);
@@ -244,10 +244,45 @@ class BetServiceTest {
     }
 
     @Test
+    void marketOfAnotherEventIsRejectedAsInvalid() {
+        when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
+        when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
+                new MarketStateReader.MarketState(MARKET, "another-event", MarketStatus.ACTIVE, now)));
+
+        PlaceBetResponse response = service.placeBet(request("2.10", "key-1"));
+
+        assertThat(response.status()).isEqualTo(BetOutcome.INVALID_REQUEST);
+        verify(betRepository, never()).insertIfAbsent(any());
+        verify(outboxRepository, never()).save(any());
+    }
+
+    @Test
+    void marketThatBelongsToNoEventIsRejectedAsInvalid() {
+        when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
+        when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
+                new MarketStateReader.MarketState(MARKET, null, MarketStatus.ACTIVE, now)));
+
+        assertThat(service.placeBet(request("2.10", "key-1")).status())
+                .isEqualTo(BetOutcome.INVALID_REQUEST);
+    }
+
+    @Test
+    void suspendedMarketOfAnotherEventIsInvalidNotSuspended() {
+        // The order of the two checks: "try again later" would be the wrong answer to a request
+        // that can never succeed.
+        when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
+        when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
+                new MarketStateReader.MarketState(MARKET, "another-event", MarketStatus.SUSPENDED, now)));
+
+        assertThat(service.placeBet(request("2.10", "key-1")).status())
+                .isEqualTo(BetOutcome.INVALID_REQUEST);
+    }
+
+    @Test
     void unknownSelectionIsRejectedAsInvalid() {
         when(marketState.findEventStatus(EVENT)).thenReturn(Optional.of(EventStatus.LIVE));
         when(marketState.findMarket(MARKET)).thenReturn(Optional.of(
-                new MarketStateReader.MarketState(MARKET, MarketStatus.ACTIVE, now)));
+                new MarketStateReader.MarketState(MARKET, EVENT, MarketStatus.ACTIVE, now)));
         when(marketState.findOdds(MARKET, SELECTION)).thenReturn(Optional.empty());
 
         assertThat(service.placeBet(request("2.10", "key-1")).status())

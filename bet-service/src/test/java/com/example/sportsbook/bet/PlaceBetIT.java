@@ -261,6 +261,43 @@ class PlaceBetIT {
         assertThat(betRepository.count()).isEqualTo(before);
     }
 
+    /**
+     * A bet names an event and a market. Each is checked on its own (the event is LIVE, the market
+     * is ACTIVE), but nothing checks that the market belongs to that event. Settlement selects bets
+     * by event id AND market id, so a bet stored with event A and a market of event B matches no
+     * settlement and stays OPEN forever, even when its selection wins.
+     */
+    @Test
+    void betThatNamesOneEventAndAnotherEventsMarketIsRejected() {
+        String otherEvent = "event-it-other-" + UUID.randomUUID();
+        String otherEventsMarket = "market-it-other-" + UUID.randomUUID();
+        seedBettableMarket(otherEvent, otherEventsMarket);
+
+        // EVENT_ID is live and has its own market; the request pairs it with the other event's market.
+        ResponseEntity<PlaceBetResponse> response = restTemplate.postForEntity("/api/v1/bets",
+                request(EVENT_ID, otherEventsMarket, "it-" + UUID.randomUUID()), PlaceBetResponse.class);
+
+        // 400, not 422: this pair of ids can never be accepted, so there is nothing to retry.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().status())
+                .as("the market does not belong to the event the bet names")
+                .isEqualTo(BetOutcome.INVALID_REQUEST);
+        assertThat(openBetsOn(otherEventsMarket)).isZero();
+    }
+
+    @Test
+    void unknownSelectionIsABadRequest() {
+        ResponseEntity<PlaceBetResponse> response = restTemplate.postForEntity("/api/v1/bets",
+                new PlaceBetRequest("user-42", EVENT_ID, MARKET_ID, "no-such-selection",
+                        new BigDecimal("100.00"), new BigDecimal("2.10"), "it-" + UUID.randomUUID()),
+                PlaceBetResponse.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().status()).isEqualTo(BetOutcome.INVALID_REQUEST);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Late bets: a bet must never end up OPEN on a market settlement has already processed.
     //

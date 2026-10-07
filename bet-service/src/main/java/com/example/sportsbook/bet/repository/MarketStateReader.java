@@ -16,6 +16,12 @@ import java.util.Optional;
  *
  * <p>A thin reader of its own rather than a shared library: common-domain stays plain Java with no
  * Spring Data dependency, and bet-service needs different fields than odds-service does.
+ *
+ * <p>The three lookups are three round trips, so the event status, the market and the odds can come
+ * from three different moments. Reading them in one atomic step (a Lua script, or MULTI/EXEC) would
+ * give one consistent view. It would not make Redis less behind Kafka, and it would not close the
+ * gap between this read and the insert: that is what the Postgres lock and fence in
+ * {@code BetService} are for.
  */
 @Repository
 public class MarketStateReader {
@@ -55,7 +61,9 @@ public class MarketStateReader {
             // Unknown must never read as bettable.
             marketStatus = MarketStatus.SUSPENDED;
         }
-        return Optional.of(new MarketState(marketId, marketStatus, Instant.parse(String.valueOf(lastUpdatedAt))));
+        Object eventId = fields.get(RedisKeys.FIELD_EVENT_ID);
+        return Optional.of(new MarketState(marketId, eventId == null ? null : String.valueOf(eventId),
+                marketStatus, Instant.parse(String.valueOf(lastUpdatedAt))));
     }
 
     public Optional<BigDecimal> findOdds(String marketId, String selectionId) {
@@ -63,6 +71,10 @@ public class MarketStateReader {
         return odds == null ? Optional.empty() : Optional.of(new BigDecimal(String.valueOf(odds)));
     }
 
-    public record MarketState(String marketId, MarketStatus status, Instant lastUpdatedAt) {
+    /**
+     * @param eventId the event this market belongs to, as the projection recorded it; null if the
+     *                market hash has no event id, which callers must treat as "belongs to nothing"
+     */
+    public record MarketState(String marketId, String eventId, MarketStatus status, Instant lastUpdatedAt) {
     }
 }

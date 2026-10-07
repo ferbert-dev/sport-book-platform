@@ -18,7 +18,8 @@ and still open are listed at the end.
 | 6 | Settlement could publish a payout for a bet it then failed to settle | Settlement writes its events to the transactional outbox | `0e1c158` |
 | 7 | One bad record could stall settlement for a whole partition | Data errors are not retried; the record is abandoned | `3a062b1` |
 | 8 | A bet could be accepted whose payout could not be stored | Stake limited in two layers | `6984419` |
-| 9 | The loser of a concurrent idempotency-key race got HTTP 500 | Conflict-safe insert instead of insert-and-catch | branch `changes` |
+| 9 | The loser of a concurrent idempotency-key race got HTTP 500 | Conflict-safe insert instead of insert-and-catch | `5674bf1` |
+| 10 | A bet could pair one event with another event's market | The market must belong to the event the bet names | branch `changes` |
 
 ---
 
@@ -194,13 +195,34 @@ the same statement on `uk_settlement_market_version`.
 the unique index, loses, and answers 201 with the winner's bet id. `SettlementIT`: a redelivered
 settlement registers nothing.
 
+## 10. A bet could pair one event with another event's market
+
+**Problem.** A bet names an event and a market. `BetService` checked each on its own (event `LIVE`,
+market `ACTIVE`) and never that the market belongs to the event; `MarketStateReader` read the
+market's event id from Redis and discarded it. Reproduced on the running stack: a bet with event A's
+id and a market of event B was accepted with 201; when B was settled with that bet's selection as
+the winner, settlement found zero bets (it selects by event id **and** market id) and the bet stayed
+`OPEN`. It also bypassed the event check: naming any live event let a bet through on the market of
+an event that had already finished.
+
+**Fix.** `MarketState` carries the market's event id, and `BetService` rejects the bet with
+`INVALID_REQUEST` unless it equals the event the request names. A market with no event id belongs
+to nothing. The check runs before the market status, so a suspended market of another event is not
+answered with "suspended, try again later".
+
+`BetController` now answers 400 for `INVALID_REQUEST`, as the README already said; before, every
+outcome except `ACCEPTED` was sent as 422, an unknown selection included. 422 is kept for requests
+that may succeed later or with other values.
+
+**Verified by.** `PlaceBetIT`: the mismatched pair and an unknown selection both answer 400
+`INVALID_REQUEST`, and no bet row is written.
+
 ---
 
 ## Known and still open
 
 | Problem | Effect | Direction |
 | --- | --- | --- |
-| Market ownership is not checked | A bet with a live event id and another event's market is accepted and never settled | Compare the market's stored event id |
 | The outbox relay is a single poller | A second instance would send every row twice | Claim rows with `FOR UPDATE SKIP LOCKED`, or CDC |
 | `StalenessDetector` reads status and then writes it | It can overwrite `SETTLED` | One atomic conditional write |
 | The projection's version guard is read-then-write | Not atomic with the write it guards | One atomic conditional write |
