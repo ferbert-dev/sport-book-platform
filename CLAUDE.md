@@ -129,6 +129,10 @@ Client → bet-service → Redis (validate) → Postgres (bet + outbox) → Kafk
 8. **Money and odds are `BigDecimal`** (`NUMERIC` in SQL), timestamps are `Instant`, internal ids
    are `UUID`. No doubles anywhere near money. Payout uses decimal odds that *include* the stake:
    `stake * acceptedOdds`, scale 2, `HALF_UP`.
+   **A stake is limited twice, so a payout always fits its column** (`NUMERIC(19,4)`): the request
+   allows at most 8 integer digits (400 `INVALID_REQUEST`), and `sportsbook.bet.max-stake` is the
+   business limit checked in `BetService` right after the idempotency replay (422
+   `STAKE_LIMIT_EXCEEDED`). `BetServiceProperties` refuses to start with a limit of 10⁹ or more.
 9. **Constructor injection only.** No field injection.
 
 ### Idempotency: the unique constraint is the fence, not the read

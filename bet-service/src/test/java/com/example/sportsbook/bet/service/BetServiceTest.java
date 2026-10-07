@@ -33,6 +33,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class BetServiceTest {
@@ -61,7 +62,7 @@ class BetServiceTest {
     @BeforeEach
     void setUp() {
         BetServiceProperties properties =
-                new BetServiceProperties(Duration.ofSeconds(30), BigDecimal.ZERO);
+                new BetServiceProperties(Duration.ofSeconds(30), BigDecimal.ZERO, new BigDecimal("10000"));
         service = new BetService(betRepository, processedSettlementRepository, outboxRepository, marketState,
 		        properties, SportsbookJson.create(), clock, new SimpleMeterRegistry());
 
@@ -78,6 +79,53 @@ class BetServiceTest {
     private PlaceBetRequest request(String expectedOdds, String idempotencyKey) {
         return new PlaceBetRequest(USER, EVENT, MARKET, SELECTION,
                 new BigDecimal("100.00"), new BigDecimal(expectedOdds), idempotencyKey);
+    }
+
+    private PlaceBetRequest requestWithStake(String stake, String idempotencyKey) {
+        return new PlaceBetRequest(USER, EVENT, MARKET, SELECTION,
+                new BigDecimal(stake), new BigDecimal("2.10"), idempotencyKey);
+    }
+
+    @Test
+    void stakeAboveTheLimitIsRejectedBeforeAnyMarketStateIsRead() {
+        PlaceBetResponse response = service.placeBet(requestWithStake("10000.01", "key-1"));
+
+        assertThat(response.status()).isEqualTo(BetOutcome.STAKE_LIMIT_EXCEEDED);
+        verifyNoInteractions(marketState);
+        verify(betRepository, never()).saveAndFlush(any());
+        verify(outboxRepository, never()).save(any());
+    }
+
+    @Test
+    void stakeExactlyAtTheLimitIsAccepted() {
+        marketIsBettable(new BigDecimal("2.10"));
+
+        PlaceBetResponse response = service.placeBet(requestWithStake("10000.00", "key-1"));
+
+        assertThat(response.status()).isEqualTo(BetOutcome.ACCEPTED);
+    }
+
+    @Test
+    void theLimitComparesAmountsNotTheNumberOfDecimals() {
+        marketIsBettable(new BigDecimal("2.10"));
+
+        // 10000.0000 and the configured 10000 are the same amount at different scales.
+        PlaceBetResponse response = service.placeBet(requestWithStake("10000.0000", "key-1"));
+
+        assertThat(response.status()).isEqualTo(BetOutcome.ACCEPTED);
+    }
+
+    @Test
+    void retryOfABetAcceptedUnderAHigherLimitStillReturnsThatBet() {
+        Bet acceptedEarlier = Bet.accept(USER, EVENT, MARKET, SELECTION, new BigDecimal("50000.00"),
+                new BigDecimal("2.10"), "key-1");
+        when(betRepository.findByUserIdAndIdempotencyKey(USER, "key-1"))
+                .thenReturn(Optional.of(acceptedEarlier));
+
+        PlaceBetResponse response = service.placeBet(requestWithStake("50000.00", "key-1"));
+
+        assertThat(response.status()).isEqualTo(BetOutcome.ACCEPTED);
+        assertThat(response.betId()).isEqualTo(acceptedEarlier.getId().toString());
     }
 
     @Test

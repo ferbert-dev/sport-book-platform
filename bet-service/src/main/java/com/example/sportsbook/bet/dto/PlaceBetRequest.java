@@ -13,9 +13,13 @@ public record PlaceBetRequest(
         @NotBlank String marketId,
         @NotBlank String selectionId,
 
+        // Technical ceiling, independent of the business limit (sportsbook.bet.max-stake): with at
+        // most 8 integer digits here and 6 on the odds, the worst payout is below 10^14 and always
+        // fits bet.payout, NUMERIC(19,4). A violation is a malformed request (400), not a business
+        // rejection (422).
         @NotNull
         @DecimalMin(value = "0.01", message = "stake must be positive")
-        @Digits(integer = 15, fraction = 4)
+        @Digits(integer = 8, fraction = 4)
         BigDecimal stake,
 
         @NotNull

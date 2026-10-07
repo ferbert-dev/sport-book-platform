@@ -40,6 +40,9 @@ sportsbook:
     market-freshness-threshold: 30s
     # Zero tolerance: any odds movement rejects the bet and the client must re-offer.
     odds-tolerance: 0
+    # Largest stake accepted for one bet. A business limit; the request's own digit limit is the
+    # technical ceiling. Must stay below 10^9 so that stake x odds always fits the payout column.
+    max-stake: 10000
     outbox-poll-interval: 1000
 
 management:

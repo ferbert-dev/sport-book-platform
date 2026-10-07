@@ -94,6 +94,15 @@ public class BetService {
             return PlaceBetResponse.accepted(bet.getId().toString(), bet.getAcceptedOdds());
         }
 
+        // 1b. Stake limit. After the replay above: a retry of a bet accepted under an older, higher
+        //     limit must still get that bet back. Before everything below: it needs no I/O. This is
+        //     what keeps "a bet whose payout cannot be stored" from ever being accepted.
+        //     compareTo, because BigDecimal.equals would also compare scale.
+        if (request.stake().compareTo(properties.maxStake()) > 0) {
+            return reject(request, BetOutcome.STAKE_LIMIT_EXCEEDED,
+                    "Stake exceeds the maximum of " + properties.maxStake().toPlainString());
+        }
+
         // 2. Event must be live.
         EventStatus eventStatus = marketState.findEventStatus(request.eventId()).orElse(null);
         if (eventStatus != EventStatus.LIVE) {

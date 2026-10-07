@@ -228,6 +228,39 @@ class PlaceBetIT {
         assertThat(betRepository.count()).isEqualTo(before);
     }
 
+    private PlaceBetRequest requestWithStake(String stake) {
+        return new PlaceBetRequest("user-42", EVENT_ID, MARKET_ID, SELECTION,
+                new BigDecimal(stake), new BigDecimal("2.10"), "it-" + UUID.randomUUID());
+    }
+
+    @Test
+    void stakeAboveTheBusinessLimitIsRejectedAsABusinessRule() {
+        long before = betRepository.count();
+
+        ResponseEntity<PlaceBetResponse> response = restTemplate.postForEntity("/api/v1/bets",
+                requestWithStake("10000.01"), PlaceBetResponse.class);
+
+        // Well-formed request, refused by a rule: 422, like a suspended market.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().status()).isEqualTo(BetOutcome.STAKE_LIMIT_EXCEEDED);
+        assertThat(betRepository.count()).isEqualTo(before);
+    }
+
+    @Test
+    void stakeBeyondTheTechnicalCeilingIsAMalformedRequest() {
+        long before = betRepository.count();
+
+        // Nine integer digits: more than the request allows, whatever the configured limit is.
+        ResponseEntity<PlaceBetResponse> response = restTemplate.postForEntity("/api/v1/bets",
+                requestWithStake("123456789.00"), PlaceBetResponse.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().status()).isEqualTo(BetOutcome.INVALID_REQUEST);
+        assertThat(betRepository.count()).isEqualTo(before);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Late bets: a bet must never end up OPEN on a market settlement has already processed.
     //

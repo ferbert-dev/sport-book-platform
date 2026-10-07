@@ -407,7 +407,8 @@ Two mechanisms, because one is not enough:
 | `EVENT_NOT_LIVE` | 422 | Event is not `LIVE` |
 | `STALE_MARKET_DATA` | 422 | Market state older than the freshness threshold |
 | `MARKET_SETTLED` | 422 | Settlement has already processed the market; Redis had not caught up yet |
-| `INVALID_REQUEST` | 400 | Validation failure or unknown selection |
+| `STAKE_LIMIT_EXCEEDED` | 422 | Stake above `sportsbook.bet.max-stake` (default 10000) |
+| `INVALID_REQUEST` | 400 | Validation failure (including a stake with more than 8 integer digits) or unknown selection |
 
 422 rather than 400 for market conditions: the request was well-formed, the world moved.
 
