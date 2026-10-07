@@ -9,6 +9,7 @@ import com.example.sportsbook.bet.dto.PlaceBetResponse;
 import com.example.sportsbook.bet.repository.BetRepository;
 import com.example.sportsbook.bet.repository.MarketStateReader;
 import com.example.sportsbook.bet.repository.OutboxRepository;
+import com.example.sportsbook.bet.repository.ProcessedSettlementRepository;
 import com.example.sportsbook.common.BetEventType;
 import com.example.sportsbook.common.BetPlacedEvent;
 import com.example.sportsbook.common.EventStatus;
@@ -43,6 +44,7 @@ public class BetService {
     private static final String AGGREGATE_TYPE = "BET";
 
     private final BetRepository betRepository;
+    private final ProcessedSettlementRepository processedSettlementRepository;
     private final OutboxRepository outboxRepository;
     private final MarketStateReader marketState;
     private final BetServiceProperties properties;
@@ -54,7 +56,7 @@ public class BetService {
     private final Counter duplicates;
     private final Timer acceptanceLatency;
 
-    public BetService(BetRepository betRepository,
+    public BetService(BetRepository betRepository, ProcessedSettlementRepository processedSettlementRepository,
                       OutboxRepository outboxRepository,
                       MarketStateReader marketState,
                       BetServiceProperties properties,
@@ -62,7 +64,8 @@ public class BetService {
                       Clock clock,
                       MeterRegistry meterRegistry) {
         this.betRepository = betRepository;
-        this.outboxRepository = outboxRepository;
+	    this.processedSettlementRepository = processedSettlementRepository;
+	    this.outboxRepository = outboxRepository;
         this.marketState = marketState;
         this.properties = properties;
         this.objectMapper = objectMapper;
@@ -127,6 +130,25 @@ public class BetService {
                     request.userId(), request.marketId(), request.expectedOdds(), currentOdds);
             rejected.increment();
             return PlaceBetResponse.oddsChanged(currentOdds);
+        }
+
+        // 6. Final gate, in Postgres. Everything above was read from Redis, which lags Kafka, while
+        //    settlement-service reads Kafka directly and selects a market's OPEN bets exactly once.
+        //    A bet that commits after that would stay OPEN forever, so this bet and that settlement
+        //    are serialised on a per-market lock:
+        //
+        //      here:        lock SHARED    -> is the market settled? -> insert the bet
+        //      settlement:  lock EXCLUSIVE -> insert its fence row   -> select OPEN bets
+        //
+        //    Either this transaction commits first and settlement, once it gets the lock, sees the
+        //    bet; or settlement commits first and the check below sees its fence row. The check
+        //    relies on READ COMMITTED (the default): each statement gets a fresh snapshot, so after
+        //    waiting for the lock it sees what settlement committed meanwhile.
+        //    Shared, because bets on one market must not queue behind each other, only behind a
+        //    settlement. The lock is transaction-scoped: commit or rollback releases it.
+        processedSettlementRepository.lockForBetPlacement(request.marketId());
+        if (processedSettlementRepository.existsByMarketId(request.marketId())) {
+            return reject(request, BetOutcome.MARKET_SETTLED, "Market is already settled");
         }
 
         return persist(request, currentOdds);

@@ -390,6 +390,7 @@ Two mechanisms, because one is not enough:
 | `MARKET_SUSPENDED` | 422 | Market not `ACTIVE`, or has no state |
 | `EVENT_NOT_LIVE` | 422 | Event is not `LIVE` |
 | `STALE_MARKET_DATA` | 422 | Market state older than the freshness threshold |
+| `MARKET_SETTLED` | 422 | Settlement has already processed the market; Redis had not caught up yet |
 | `INVALID_REQUEST` | 400 | Validation failure or unknown selection |
 
 422 rather than 400 for market conditions: the request was well-formed, the world moved.
@@ -839,7 +840,7 @@ Logs use stable, greppable event names with identifiers attached:
 ./mvnw clean verify
 ```
 
-197 tests: 190 unit tests (JUnit 5, AssertJ, Mockito) plus 7 Testcontainers integration tests.
+201 tests: 192 unit tests (JUnit 5, AssertJ, Mockito) plus 9 Testcontainers integration tests.
 
 | Module | Coverage |
 | --- | --- |

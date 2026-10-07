@@ -23,6 +23,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -67,6 +68,19 @@ class SettlementServiceTest {
 
     private MarketSettledEvent settledEvent() {
         return new MarketSettledEvent(EVENT_ID, MARKET_ID, WINNER, SETTLEMENT_VERSION, Instant.now());
+    }
+
+    @Test
+    void theMarketLockIsTakenBeforeTheFenceRowAndBeforeTheBetsAreSelected() {
+        openBets();
+
+        service.settle(settledEvent());
+
+        // The order is the fix: a lock taken after the SELECT would protect nothing.
+        var order = inOrder(processedSettlements, betRepository);
+        order.verify(processedSettlements).lockForSettlement(MARKET_ID);
+        order.verify(processedSettlements).saveAndFlush(any());
+        order.verify(betRepository).findByEventIdAndMarketIdAndStatus(EVENT_ID, MARKET_ID, BetStatus.OPEN);
     }
 
     private void openBets(Bet... bets) {

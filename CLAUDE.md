@@ -14,7 +14,7 @@ Maven only. **Never add Gradle files.**
 ## Commands
 
 ```bash
-./mvnw clean verify                   # canonical build: compile + 190 unit + 7 integration tests
+./mvnw clean verify                   # canonical build: compile + 192 unit + 9 integration tests
 ./mvnw test                           # unit tests only (no Docker needed)
 ./mvnw -pl bet-service -am test       # one module plus its dependencies
 
@@ -142,6 +142,22 @@ guarantees correctness:
   resolves by re-reading the winner.
 - **Settlement** — register `(marketId, settlementVersion)` in `processed_settlements` first,
   with the same read-then-insert-then-catch shape on `uk_settlement_market_version`.
+
+### Bet placement and settlement are serialised per market
+
+`bet-service` validates against Redis, which lags Kafka; `settlement-service` reads Kafka directly
+and selects a market's `OPEN` bets exactly once. A bet committing after that select would stay
+`OPEN` forever (the fence makes a redelivered `MARKET_SETTLED` a no-op). So both sides take a
+Postgres advisory lock keyed by market id, transaction-scoped:
+
+- **`BetService`**, last step before the insert: `lockForBetPlacement` (shared) →
+  `existsByMarketId` on `processed_settlements` → insert, else reject with `MARKET_SETTLED`.
+- **`SettlementService.settle`**, first statement: `lockForSettlement` (exclusive) → fence row →
+  select `OPEN` bets.
+
+The order of those calls is the fix, and the key expression (`hashtextextended(:marketId, 0)`) must
+be identical in both repositories. The check relies on `READ COMMITTED`. A Redis check is never a
+substitute: it happens before the insert and outside the transaction.
 
 `settlement-service` publishes to Kafka **inside** the transaction on purpose. If the broker is
 down, the transaction rolls back and Kafka redelivers `MARKET_SETTLED`. Publishing after commit

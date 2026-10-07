@@ -21,8 +21,11 @@ import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -37,6 +40,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -91,22 +100,37 @@ class PlaceBetIT {
     @Autowired
     private OutboxRepository outboxRepository;
 
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
     @BeforeEach
     void seedBettableMarket() {
-        redis.opsForHash().putAll(RedisKeys.event(EVENT_ID), Map.of(
+        seedBettableMarket(EVENT_ID, MARKET_ID);
+    }
+
+    /** What Redis looks like for a market that takes bets: event LIVE, market ACTIVE and fresh. */
+    private void seedBettableMarket(String eventId, String marketId) {
+        redis.opsForHash().putAll(RedisKeys.event(eventId), Map.of(
                 RedisKeys.FIELD_STATUS, EventStatus.LIVE.name(),
                 RedisKeys.FIELD_VERSION, "1000",
                 RedisKeys.FIELD_LAST_UPDATED_AT, Instant.now().toString()));
-        redis.opsForHash().putAll(RedisKeys.market(MARKET_ID), Map.of(
-                RedisKeys.FIELD_EVENT_ID, EVENT_ID,
+        redis.opsForHash().putAll(RedisKeys.market(marketId), Map.of(
+                RedisKeys.FIELD_EVENT_ID, eventId,
                 RedisKeys.FIELD_STATUS, MarketStatus.ACTIVE.name(),
                 RedisKeys.FIELD_VERSION, "1001",
                 RedisKeys.FIELD_LAST_UPDATED_AT, Instant.now().toString()));
-        redis.opsForHash().put(RedisKeys.marketOdds(MARKET_ID), SELECTION, "2.10");
+        redis.opsForHash().put(RedisKeys.marketOdds(marketId), SELECTION, "2.10");
     }
 
     private PlaceBetRequest request(String idempotencyKey) {
-        return new PlaceBetRequest("user-42", EVENT_ID, MARKET_ID, SELECTION,
+        return request(EVENT_ID, MARKET_ID, idempotencyKey);
+    }
+
+    private PlaceBetRequest request(String eventId, String marketId, String idempotencyKey) {
+        return new PlaceBetRequest("user-42", eventId, marketId, SELECTION,
                 new BigDecimal("100.00"), new BigDecimal("2.10"), idempotencyKey);
     }
 
@@ -202,6 +226,117 @@ class PlaceBetIT {
         assertThat(response.getBody()).isNotNull();
         assertThat(response.getBody().status()).isEqualTo(BetOutcome.MARKET_SUSPENDED);
         assertThat(betRepository.count()).isEqualTo(before);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Late bets: a bet must never end up OPEN on a market settlement has already processed.
+    //
+    // settlement-service selects a market's OPEN bets exactly once, and its fence row in
+    // processed_settlements makes a redelivered MARKET_SETTLED a no-op. So a bet that commits
+    // after that point is never settled: nothing will ever look at it again.
+    //
+    // Both tests use their own event and market, because they leave a settlement behind.
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Race 1, Redis lag. settlement-service consumes MARKET_SETTLED straight from Kafka;
+     * bet-service validates against Redis, which state-processor updates on its own schedule.
+     * Between the two, settlement is finished while Redis still says LIVE / ACTIVE.
+     */
+    @Test
+    void betOnAMarketSettlementHasAlreadyProcessedIsRejectedEvenWhileRedisStillSaysActive() {
+        String eventId = "event-it-late-" + UUID.randomUUID();
+        String marketId = "market-it-late-" + UUID.randomUUID();
+        seedBettableMarket(eventId, marketId);
+        // settlement-service is done with this market: its fence row is committed.
+        jdbc.update("INSERT INTO processed_settlements (id, market_id, settlement_version, processed_at) "
+                + "VALUES (?, ?, ?, now())", UUID.randomUUID(), marketId, 2000L);
+
+        PlaceBetResponse response = restTemplate.postForEntity("/api/v1/bets",
+                request(eventId, marketId, "it-" + UUID.randomUUID()), PlaceBetResponse.class).getBody();
+
+        assertThat(response).isNotNull();
+        assertThat(response.status())
+                .as("a bet on a market that is already settled must not be accepted")
+                .isEqualTo(BetOutcome.MARKET_SETTLED);
+        assertThat(openBetsOn(marketId))
+                .as("OPEN bets nobody will ever settle")
+                .isZero();
+    }
+
+    /**
+     * Race 2, interleaved transactions, with Redis perfectly up to date at the moment the bet reads
+     * it. Settlement has selected the OPEN bets but not committed yet; the bet commits in that gap.
+     *
+     * <p>The settlement side is a stand-in that runs the same statements as
+     * {@code SettlementService.settle}, in the same order, in one transaction; the latches hold it
+     * open between its SELECT and its commit so the interleaving is deterministic.
+     *
+     * <p>With the per-market lock the bet waits for the settlement transaction, then finds its fence
+     * row and is rejected. The bet is given a moment before settlement is released, so the test also
+     * shows the pre-fix behaviour (the bet committing at once) instead of hanging on it.
+     */
+    @Test
+    void betCommittedWhileSettlementIsInFlightIsNotLeftOpenOnASettledMarket() throws Exception {
+        String eventId = "event-it-race-" + UUID.randomUUID();
+        String marketId = "market-it-race-" + UUID.randomUUID();
+        seedBettableMarket(eventId, marketId);
+
+        CountDownLatch settlementHasSelected = new CountDownLatch(1);
+        CountDownLatch betHasBeenAttempted = new CountDownLatch(1);
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<Integer> settlement = pool.submit(() -> transaction.execute(status -> {
+                // Same first statement as SettlementService.settle.
+                jdbc.queryForObject("SELECT 1 FROM pg_advisory_xact_lock(hashtextextended(?, 0))",
+                        Integer.class, marketId);
+                jdbc.update("INSERT INTO processed_settlements (id, market_id, settlement_version, processed_at) "
+                        + "VALUES (?, ?, ?, now())", UUID.randomUUID(), marketId, 2000L);
+                Integer openBets = jdbc.queryForObject("SELECT count(*) FROM bet "
+                        + "WHERE event_id = ? AND market_id = ? AND status = 'OPEN'", Integer.class, eventId, marketId);
+                settlementHasSelected.countDown();
+                awaitQuietly(betHasBeenAttempted);
+                return openBets;
+            }));
+            assertThat(settlementHasSelected.await(10, TimeUnit.SECONDS)).isTrue();
+
+            Future<PlaceBetResponse> bet = pool.submit(() -> restTemplate.postForEntity("/api/v1/bets",
+                    request(eventId, marketId, "it-" + UUID.randomUUID()), PlaceBetResponse.class).getBody());
+            try {
+                bet.get(2, TimeUnit.SECONDS);
+            } catch (TimeoutException waitingForSettlement) {
+                // Fine: the bet is blocked behind the settlement transaction.
+            }
+            betHasBeenAttempted.countDown();
+
+            assertThat(settlement.get(10, TimeUnit.SECONDS))
+                    .as("settlement selected its OPEN bets before the bet existed")
+                    .isZero();
+            PlaceBetResponse response = bet.get(10, TimeUnit.SECONDS);
+
+            assertThat(response).isNotNull();
+            assertThat(response.status()).isEqualTo(BetOutcome.MARKET_SETTLED);
+            assertThat(openBetsOn(marketId))
+                    .as("OPEN bets on a settled market: settlement never saw them and never will")
+                    .isZero();
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private long openBetsOn(String marketId) {
+        Long open = jdbc.queryForObject(
+                "SELECT count(*) FROM bet WHERE market_id = ? AND status = 'OPEN'", Long.class, marketId);
+        return open == null ? 0 : open;
+    }
+
+    private void awaitQuietly(CountDownLatch latch) {
+        try {
+            latch.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Reads bet-events from the beginning looking for this bet's BET_PLACED payload. */

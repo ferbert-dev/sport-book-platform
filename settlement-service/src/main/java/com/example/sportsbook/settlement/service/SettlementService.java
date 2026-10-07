@@ -60,6 +60,19 @@ public class SettlementService {
     public boolean settle(MarketSettledEvent event) {
         long settlementVersion = event.version();
 
+        // First statement, before the fence row and before the bets are selected: bet-service takes
+        // the same lock in shared mode around "is this market settled? -> insert the bet". So every
+        // bet that got in before us has committed by the time we hold the lock and is selected
+        // below, and every bet after us finds the fence row and is rejected. Without it a bet could
+        // commit between our SELECT and our COMMIT and stay OPEN forever.
+        // Kafka sends happen inside this transaction, so bets on this market wait for them too;
+        // acceptable for a market that is closing.
+        processedSettlements.lockForSettlement(event.marketId());
+
+        // TODO(late-bet 9, later): detection as a second layer. A scheduled reconciliation that finds
+        //   OPEN bets whose market has a row in processed_settlements, alerts, and voids them. It
+        //   needs the result stored (today the fence row has only market id and version).
+
         if (!registerSettlement(event.marketId(), settlementVersion)) {
             duplicateSettlements.increment();
             log.info("DUPLICATE_SETTLEMENT_SKIPPED marketId={} settlementVersion={}",

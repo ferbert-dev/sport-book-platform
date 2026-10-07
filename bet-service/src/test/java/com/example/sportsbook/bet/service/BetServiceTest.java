@@ -9,6 +9,7 @@ import com.example.sportsbook.bet.dto.PlaceBetResponse;
 import com.example.sportsbook.bet.repository.BetRepository;
 import com.example.sportsbook.bet.repository.MarketStateReader;
 import com.example.sportsbook.bet.repository.OutboxRepository;
+import com.example.sportsbook.bet.repository.ProcessedSettlementRepository;
 import com.example.sportsbook.common.BetEventType;
 import com.example.sportsbook.common.EventStatus;
 import com.example.sportsbook.common.MarketStatus;
@@ -28,6 +29,7 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -46,15 +48,22 @@ class BetServiceTest {
     private final BetRepository betRepository = mock(BetRepository.class);
     private final OutboxRepository outboxRepository = mock(OutboxRepository.class);
     private final MarketStateReader marketState = mock(MarketStateReader.class);
-
+    private final ProcessedSettlementRepository processedSettlementRepository = mock(ProcessedSettlementRepository.class);
     private BetService service;
+
+    // TODO(late-bet 8): add unit tests for the new rule (the mock returns false by default, so none
+    //   of the existing tests exercises it):
+    //   - settled market -> outcome MARKET_SETTLED, and verify(betRepository, never()).saveAndFlush(any())
+    //     and verify(outboxRepository, never()).save(any());
+    //   - a retry with an existing idempotency key on a settled market still returns the original
+    //     bet as ACCEPTED (the replay check runs first).
 
     @BeforeEach
     void setUp() {
         BetServiceProperties properties =
                 new BetServiceProperties(Duration.ofSeconds(30), BigDecimal.ZERO);
-        service = new BetService(betRepository, outboxRepository, marketState, properties,
-                SportsbookJson.create(), clock, new SimpleMeterRegistry());
+        service = new BetService(betRepository, processedSettlementRepository, outboxRepository, marketState,
+		        properties, SportsbookJson.create(), clock, new SimpleMeterRegistry());
 
         when(betRepository.findByUserIdAndIdempotencyKey(any(), any())).thenReturn(Optional.empty());
     }
@@ -81,6 +90,19 @@ class BetServiceTest {
         assertThat(response.betId()).isNotNull();
         assertThat(response.acceptedOdds()).isEqualByComparingTo("2.10");
         verify(betRepository).saveAndFlush(any(Bet.class));
+    }
+
+    @Test
+    void theMarketLockIsTakenBeforeTheSettledCheckAndTheCheckBeforeTheInsert() {
+        marketIsBettable(new BigDecimal("2.10"));
+
+        service.placeBet(request("2.10", "key-1"));
+
+        // The order is the fix: checking before locking, or inserting before checking, reopens the race.
+        var order = inOrder(processedSettlementRepository, betRepository);
+        order.verify(processedSettlementRepository).lockForBetPlacement(MARKET);
+        order.verify(processedSettlementRepository).existsByMarketId(MARKET);
+        order.verify(betRepository).saveAndFlush(any(Bet.class));
     }
 
     @Test

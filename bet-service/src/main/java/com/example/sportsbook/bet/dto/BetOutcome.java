@@ -7,5 +7,7 @@ public enum BetOutcome {
     MARKET_SUSPENDED,
     EVENT_NOT_LIVE,
     STALE_MARKET_DATA,
+    /** Settlement has already processed this market; Redis had not caught up yet. */
+    MARKET_SETTLED,
     INVALID_REQUEST
 }
