@@ -173,9 +173,11 @@ Both writers use the transactional outbox, and there is **one** table and **one*
   can leave a payout in Kafka for a bet the database then failed to settle (the commit fails after
   the send), and sending after the commit can lose the event for good (the fence skips the retry).
 - Do not add a second relay for the same table: without row claiming both would send every row.
-- A failing `MARKET_SETTLED` is retried with backoff until it succeeds
-  (`SettlementConfig.settlementErrorHandler`); the Spring Kafka default would skip it after ten
-  immediate attempts.
+- A failing `MARKET_SETTLED` is handled by `SettlementConfig.settlementErrorHandler`: transient
+  failures are retried with backoff until they succeed (the Spring Kafka default would skip the
+  record after ten immediate attempts); a `DataIntegrityViolationException` is not retried, because
+  it fails the same way forever and would block the partition for every other market. That record
+  is abandoned with `SETTLEMENT_ABANDONED`; its bets stay `OPEN` and can be settled by a replay.
 
 ### Adding a domain event
 

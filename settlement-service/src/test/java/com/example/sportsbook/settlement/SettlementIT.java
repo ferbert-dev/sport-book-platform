@@ -5,6 +5,7 @@ import com.example.sportsbook.settlement.service.SettlementService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -143,7 +144,10 @@ class SettlementIT {
         UUID ordinary = openBet(WINNER, "100.00", "2.10");
         UUID tooLargeToPay = openBet(WINNER, "600000000000000.0000", "2.0000");
 
+        // The type matters: SettlementConfig's error handler does not retry this one, because it
+        // would fail the same way forever and block the partition.
         assertThatThrownBy(() -> settlementService.settle(settled()))
+                .isInstanceOf(DataIntegrityViolationException.class)
                 .rootCause().hasMessageContaining("numeric field overflow");
 
         assertThat(statusOf(ordinary)).isEqualTo("OPEN");
